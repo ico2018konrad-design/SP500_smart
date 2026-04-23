@@ -1,219 +1,110 @@
 """Market breadth indicators.
 
-Calculates:
+Approximates:
 - % of S&P 500 stocks above 50 SMA
-- Advance/Decline line approximation
+- A/D Line (Advance/Decline)
+
+Note: Real breadth data requires a proper data provider.
+This module provides:
+1. Actual data via Yahoo Finance (RSP/SPY ratio as proxy)
+2. Approximate breadth from available data
 """
 import logging
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# Sample of S&P 500 component tickers used for breadth approximation
-# Using sector ETFs and major components as proxies for full breadth
-SP500_SECTOR_ETFS = [
-    "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC"
-]
 
-# Representative large-cap sample (30 Dow-like components)
-SP500_SAMPLE_TICKERS = [
-    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK-B",
-    "UNH", "JNJ", "JPM", "V", "PG", "MA", "HD", "CVX", "LLY",
-    "MRK", "PEP", "KO", "BAC", "ABBV", "WMT", "COST", "MCD",
-    "DIS", "CSCO", "TMO", "ABT", "CRM"
-]
-
-
-def get_pct_above_sma(
-    period: int = 50,
-    sample_tickers: Optional[list] = None,
-    lookback_days: int = 300,
-) -> float:
-    """Calculate % of S&P 500 stocks above N-day SMA.
-
-    Args:
-        period: SMA period (default 50)
-        sample_tickers: List of tickers to use (defaults to SP500_SAMPLE_TICKERS)
-        lookback_days: Days of history to download
-
-    Returns:
-        Float 0.0-1.0 representing % above SMA (e.g., 0.65 = 65%)
-    """
-    if sample_tickers is None:
-        sample_tickers = SP500_SAMPLE_TICKERS
-
-    import datetime
-    end = datetime.datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.datetime.now() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-
+def load_rsp_data(start: str = "2005-01-01") -> pd.DataFrame:
+    """Load RSP (Invesco S&P 500 Equal Weight) as breadth proxy."""
     try:
-        data = yf.download(
-            sample_tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-        )
-        if data.empty:
-            logger.warning("No breadth data available")
-            return 0.55
-
-        # Get Close prices
-        if isinstance(data.columns, pd.MultiIndex):
-            close = data["Close"]
-        else:
-            close = data[["Close"]] if "Close" in data else data
-
-        above_count = 0
-        total_count = 0
-
-        for ticker in sample_tickers:
-            try:
-                if ticker not in close.columns:
-                    continue
-                prices = close[ticker].dropna()
-                if len(prices) < period:
-                    continue
-                sma = prices.rolling(period).mean()
-                # Check most recent value
-                last_price = prices.iloc[-1]
-                last_sma = sma.iloc[-1]
-                if not pd.isna(last_sma) and not pd.isna(last_price):
-                    total_count += 1
-                    if last_price > last_sma:
-                        above_count += 1
-            except Exception:
-                continue
-
-        if total_count == 0:
-            return 0.55
-
-        pct = above_count / total_count
-        logger.info(
-            "Breadth: %d/%d stocks above %d-SMA = %.1f%%",
-            above_count, total_count, period, pct * 100
-        )
-        return pct
-
-    except Exception as exc:
-        logger.error("Failed to calculate breadth: %s", exc)
-        return 0.55
+        from src.data.yahoo_loader import load_ohlcv
+        return load_ohlcv("RSP", start)
+    except Exception:
+        return pd.DataFrame()
 
 
-def get_breadth_series(
-    period: int = 50,
-    sample_tickers: Optional[list] = None,
-    start: str = "2010-01-01",
-    end: Optional[str] = None,
+def estimate_breadth_from_etfs(
+    spy_data: pd.DataFrame,
+    lookback: int = 50,
 ) -> pd.Series:
-    """Calculate historical breadth series using sector ETFs as proxy.
+    """Estimate % of stocks above 50 SMA using SPY momentum proxy.
 
-    This is faster than downloading all 500 stocks.
-    Uses sector ETF performance relative to their SMAs.
+    A simple proxy: if SPY itself is trending well, breadth is likely > 55%.
+    More accurate would require individual stock data (expensive).
+
+    This is a simplified proxy for backtesting.
     """
-    if sample_tickers is None:
-        sample_tickers = SP500_SECTOR_ETFS
+    close = spy_data["Close"]
+    sma50 = close.rolling(50).mean()
 
-    try:
-        data = yf.download(
-            sample_tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-        )
-        if data.empty:
-            return pd.Series(dtype=float)
+    # Count "breadth-like" indicator: SPY above SMA50 and momentum positive
+    momentum = close.pct_change(20)
 
-        if isinstance(data.columns, pd.MultiIndex):
-            close = data["Close"]
-        else:
-            close = data
+    # When SPY is strong, estimate ~65% breadth; when weak, ~35%
+    breadth = pd.Series(index=close.index, dtype=float)
+    for i in range(len(close)):
+        spy_pct_above = (close.iloc[i] - sma50.iloc[i]) / sma50.iloc[i] if i >= 50 else 0
+        mom = momentum.iloc[i] if i >= 20 else 0
+        # Map to breadth estimate
+        breadth.iloc[i] = 0.50 + 0.20 * np.tanh(spy_pct_above * 10) + 0.10 * np.tanh(mom * 20)
 
-        result_dates = []
-        result_values = []
-
-        # Get common dates
-        common_dates = close.dropna(how="all").index
-
-        for date in common_dates:
-            above = 0
-            total = 0
-            for ticker in sample_tickers:
-                if ticker not in close.columns:
-                    continue
-                prices = close[ticker][:date].dropna()
-                if len(prices) < period:
-                    continue
-                sma_val = prices.rolling(period).mean().iloc[-1]
-                last_val = prices.iloc[-1]
-                if not pd.isna(sma_val) and not pd.isna(last_val):
-                    total += 1
-                    if last_val > sma_val:
-                        above += 1
-            if total > 0:
-                result_dates.append(date)
-                result_values.append(above / total)
-
-        series = pd.Series(result_values, index=result_dates, name="breadth_pct_above_50sma")
-        return series
-
-    except Exception as exc:
-        logger.error("Failed to calculate breadth series: %s", exc)
-        return pd.Series(dtype=float)
+    return breadth.clip(0.10, 0.90)
 
 
-def get_advance_decline_line(
-    start: str = "2005-01-01",
-    end: Optional[str] = None,
+def calc_advance_decline_line(
+    spy_data: pd.DataFrame,
+    rsp_data: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
-    """Approximate A/D line using SPY vs equal-weight RSP.
+    """Calculate approximate A/D line.
 
-    When RSP (equal-weight S&P 500) outperforms SPY, breadth is improving.
-    Returns normalized A/D proxy: RSP/SPY ratio.
+    Uses RSP/SPY ratio as a proxy for equal-weight vs cap-weight breadth.
+    When RSP outperforms SPY, breadth is improving.
     """
-    try:
-        data = yf.download(
-            ["SPY", "RSP"],
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-        )
-        if data.empty:
-            return pd.Series(dtype=float)
+    if rsp_data is not None and not rsp_data.empty:
+        try:
+            common = spy_data.index.intersection(rsp_data.index)
+            spy_close = spy_data.loc[common, "Close"]
+            rsp_close = rsp_data.loc[common, "Close"]
+            ratio = rsp_close / spy_close
+            # Normalize to start at 100
+            ad_line = ratio / ratio.iloc[0] * 100
+            ad_line.name = "AD_Line_Proxy"
+            return ad_line
+        except Exception as exc:
+            logger.warning("A/D line calc error: %s", exc)
 
-        if isinstance(data.columns, pd.MultiIndex):
-            close = data["Close"]
-        else:
-            return pd.Series(dtype=float)
-
-        spy = close["SPY"].dropna()
-        rsp = close["RSP"].dropna() if "RSP" in close.columns else spy.copy()
-
-        # Normalize
-        spy_norm = spy / spy.iloc[0]
-        rsp_norm = rsp / rsp.iloc[0]
-
-        ad_ratio = rsp_norm / spy_norm
-        ad_ratio.name = "ad_line_proxy"
-
-        return ad_ratio
-
-    except Exception as exc:
-        logger.error("Failed to calculate A/D line: %s", exc)
-        return pd.Series(dtype=float)
+    # Fallback: use SPY momentum as proxy
+    close = spy_data["Close"]
+    ad = close / close.iloc[0] * 100 if len(close) > 0 else close
+    ad.name = "AD_Line_Proxy"
+    return ad
 
 
-def is_ad_line_rising(lookback: int = 5) -> bool:
-    """Check if A/D line is rising over last N days."""
-    ad = get_advance_decline_line()
-    if len(ad) < lookback + 1:
-        return True  # assume positive if insufficient data
-
-    recent = ad.dropna().tail(lookback + 1)
+def is_breadth_rising(ad_line: pd.Series, lookback: int = 5) -> bool:
+    """Check if A/D line is in uptrend over lookback period."""
+    if len(ad_line) < lookback + 1:
+        return True
+    recent = ad_line.dropna().tail(lookback)
     return float(recent.iloc[-1]) > float(recent.iloc[0])
+
+
+def get_current_breadth_pct() -> float:
+    """Get current estimated breadth (% of stocks above 50 SMA).
+
+    Returns approximate value in 0.0-1.0 range.
+    Falls back to 0.55 (neutral) if data unavailable.
+    """
+    try:
+        from src.data.yahoo_loader import load_spy
+        spy = load_spy()
+        if not spy.empty:
+            breadth = estimate_breadth_from_etfs(spy)
+            if not breadth.empty:
+                return float(breadth.dropna().iloc[-1])
+    except Exception as exc:
+        logger.warning("Breadth estimation failed: %s", exc)
+    return 0.55

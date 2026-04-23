@@ -1,5 +1,10 @@
-"""Yahoo Finance data loader for SPY, VIX, UPRO, SH, SPXS."""
+"""Yahoo Finance data loader for historical OHLCV.
+
+Loads SPY, VIX, UPRO, SH, SPXS using yfinance.
+Caches data locally to reduce API calls.
+"""
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -8,113 +13,122 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+CACHE_DIR = ".data_cache"
+
+
+def _cache_path(symbol: str, start: str, end: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"{symbol}_{start}_{end}.parquet")
+
 
 def load_ohlcv(
-    ticker: str,
+    symbol: str,
     start: str = "2005-01-01",
     end: Optional[str] = None,
-    interval: str = "1d",
+    use_cache: bool = True,
 ) -> pd.DataFrame:
-    """Download OHLCV data from Yahoo Finance.
+    """Load OHLCV data for a symbol from Yahoo Finance.
 
     Args:
-        ticker: Yahoo Finance ticker symbol
-        start: Start date (YYYY-MM-DD)
-        end: End date (YYYY-MM-DD), defaults to today
-        interval: Data interval ('1d', '1h', '5m', etc.)
+        symbol: Ticker symbol (e.g., 'SPY', 'VIX', 'UPRO')
+        start: Start date string 'YYYY-MM-DD'
+        end: End date string (defaults to today)
+        use_cache: Cache results to disk
 
     Returns:
-        DataFrame with columns: Open, High, Low, Close, Volume, Adj Close
+        DataFrame with columns: Open, High, Low, Close, Volume
     """
     if end is None:
         end = datetime.now().strftime("%Y-%m-%d")
 
-    logger.info("Loading %s from %s to %s (interval=%s)", ticker, start, end, interval)
+    cache_file = _cache_path(symbol, start, end)
+
+    # Try cache first (within 1 day)
+    if use_cache and os.path.exists(cache_file):
+        file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_file))
+        if file_age < timedelta(hours=4):
+            try:
+                df = pd.read_parquet(cache_file)
+                logger.debug("Loaded %s from cache (%d rows)", symbol, len(df))
+                return df
+            except Exception:
+                pass
+
     try:
-        data = yf.download(ticker, start=start, end=end, interval=interval,
-                           auto_adjust=True, progress=False)
-        if data.empty:
-            logger.warning("No data returned for %s", ticker)
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(start=start, end=end, auto_adjust=True)
+
+        if df.empty:
+            logger.warning("No data returned for %s", symbol)
             return pd.DataFrame()
-        # Flatten multi-level columns if present
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        data.index = pd.to_datetime(data.index)
-        data.index.name = "Date"
-        logger.info("Loaded %d rows for %s", len(data), ticker)
-        return data
+
+        # Ensure standard column names
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+
+        if use_cache and not df.empty:
+            try:
+                df.to_parquet(cache_file)
+            except Exception:
+                pass
+
+        logger.info("Loaded %s: %d bars (%s to %s)", symbol, len(df), start, end)
+        return df
+
     except Exception as exc:
-        logger.error("Failed to load %s: %s", ticker, exc)
+        logger.error("Failed to load %s: %s", symbol, exc)
         return pd.DataFrame()
 
 
-def load_spy(start: str = "2005-01-01", end: Optional[str] = None) -> pd.DataFrame:
-    """Load SPY OHLCV data."""
-    return load_ohlcv("SPY", start=start, end=end)
+def load_spy(
+    start: str = "2005-01-01",
+    end: Optional[str] = None,
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """Load SPY (S&P 500 ETF) data."""
+    return load_ohlcv("SPY", start, end, use_cache)
 
 
-def load_vix(start: str = "2005-01-01", end: Optional[str] = None) -> pd.DataFrame:
-    """Load VIX index data (^VIX)."""
-    return load_ohlcv("^VIX", start=start, end=end)
+def load_vix(
+    start: str = "2005-01-01",
+    end: Optional[str] = None,
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """Load VIX (CBOE Volatility Index) data."""
+    df = load_ohlcv("^VIX", start, end, use_cache)
+    if df.empty:
+        # Fallback symbol
+        df = load_ohlcv("VIX", start, end, use_cache)
+    return df
 
 
-def load_upro(start: str = "2011-01-01", end: Optional[str] = None) -> pd.DataFrame:
-    """Load UPRO (3x S&P 500 ETF) data. Available from 2011."""
-    return load_ohlcv("UPRO", start=start, end=end)
+def load_upro(start: str = "2009-01-01", end: Optional[str] = None) -> pd.DataFrame:
+    """Load UPRO (ProShares UltraPro S&P500 3x) data."""
+    return load_ohlcv("UPRO", start, end)
 
 
 def load_sh(start: str = "2006-01-01", end: Optional[str] = None) -> pd.DataFrame:
-    """Load SH (inverse S&P 500 ETF) data."""
-    return load_ohlcv("SH", start=start, end=end)
+    """Load SH (ProShares Short S&P500 -1x) data."""
+    return load_ohlcv("SH", start, end)
 
 
 def load_spxs(start: str = "2008-01-01", end: Optional[str] = None) -> pd.DataFrame:
-    """Load SPXS (3x inverse S&P 500 ETF) data."""
-    return load_ohlcv("SPXS", start=start, end=end)
+    """Load SPXS (Direxion Daily S&P 500 Bear 3x) data."""
+    return load_ohlcv("SPXS", start, end)
 
 
-def load_vxx(start: str = "2018-01-01", end: Optional[str] = None) -> pd.DataFrame:
-    """Load VXX (VIX short-term futures ETN) data."""
-    return load_ohlcv("VXX", start=start, end=end)
+def load_vxx(start: str = "2009-01-01", end: Optional[str] = None) -> pd.DataFrame:
+    """Load VXX (iPath Series B S&P 500 VIX) data. Full mode only."""
+    return load_ohlcv("VXX", start, end)
 
 
-def load_intraday(
-    ticker: str,
-    days_back: int = 30,
-    interval: str = "5m",
-) -> pd.DataFrame:
-    """Load intraday data (limited history for short intervals)."""
-    end = datetime.now()
-    start = end - timedelta(days=days_back)
-    return load_ohlcv(
-        ticker,
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        interval=interval,
-    )
-
-
-def load_multiple(
-    tickers: list,
-    start: str = "2005-01-01",
-    end: Optional[str] = None,
-    interval: str = "1d",
-) -> dict:
-    """Load multiple tickers at once.
-
-    Returns dict of {ticker: DataFrame}.
-    """
-    result = {}
-    for ticker in tickers:
-        result[ticker] = load_ohlcv(ticker, start=start, end=end, interval=interval)
-    return result
-
-
-def get_spy_intraday_hourly(days_back: int = 30) -> pd.DataFrame:
-    """Get SPY hourly data for signal generation."""
-    return load_intraday("SPY", days_back=days_back, interval="1h")
-
-
-def get_spy_intraday_5min(days_back: int = 7) -> pd.DataFrame:
-    """Get SPY 5-minute data for VWAP calculation."""
-    return load_intraday("SPY", days_back=days_back, interval="5m")
+def get_current_price(symbol: str) -> Optional[float]:
+    """Get the latest closing price for a symbol."""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="2d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception as exc:
+        logger.error("Failed to get current price for %s: %s", symbol, exc)
+    return None
