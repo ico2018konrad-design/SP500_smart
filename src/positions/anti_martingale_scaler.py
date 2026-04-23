@@ -36,13 +36,20 @@ class AntiMartingaleScaler:
         max_positions: int = 6,
         position_size_pct: float = 0.1667,   # 16.67% per position (1/6)
         backtest_mode: bool = False,         # True: bypass real-time clock checks
+        allocated_capital: Optional[float] = None,  # fixed base capital for equal-dollar sizing
     ):
         self.profit_threshold = profit_threshold
         self.min_hours_between = min_hours_between
         self.max_positions = max_positions
         self.position_size_pct = position_size_pct
         self.backtest_mode = backtest_mode
+        self._allocated_capital = allocated_capital
         self._last_entry_time: Optional[datetime] = None
+
+    def set_allocated_capital(self, capital: float) -> None:
+        """Set the fixed allocated capital for equal-dollar position sizing."""
+        self._allocated_capital = capital
+        logger.info("Scaler: allocated capital set to %.2f", capital)
 
     def can_scale_in(
         self,
@@ -63,9 +70,10 @@ class AntiMartingaleScaler:
         """
         open_positions = position_manager.get_open_positions()
 
-        # Check max positions
-        if len(open_positions) >= self.max_positions:
-            return False, f"At max positions ({self.max_positions})"
+        # Check max positions (use the stricter of scaler limit and position manager limit)
+        effective_max = min(self.max_positions, position_manager.max_positions)
+        if len(open_positions) >= effective_max:
+            return False, f"At max positions ({effective_max})"
 
         # Check time since last entry
         if self._last_entry_time is not None:
@@ -115,6 +123,7 @@ class AntiMartingaleScaler:
         current_prices: Dict[str, float],
         atr: float = 0.0,
         backtest_time: Optional[datetime] = None,
+        allocated_capital: Optional[float] = None,
     ) -> Optional[Position]:
         """Execute scale-in if conditions are met.
 
@@ -145,8 +154,10 @@ class AntiMartingaleScaler:
         ]
         scale_number = len(existing) + 1
 
-        # Calculate position size
-        position_capital = capital * self.position_size_pct
+        # Calculate position size — use allocated_capital for equal-dollar sizing
+        # This ensures Position #6 is the same dollar size as Position #1
+        effective_cap = allocated_capital or self._allocated_capital or capital
+        position_capital = effective_cap * self.position_size_pct
         entry_price = current_prices.get(symbol, signal.entry_price)
         shares = max(1, int(position_capital / entry_price))
 
