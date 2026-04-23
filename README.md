@@ -189,6 +189,22 @@ SP500_smart/
 
 ---
 
+## 🔧 Recent Fixes (v1.2)
+
+- **Adaptive signal mode** — `LongSignalGenerator` now branches based on regime:
+  - `STRONG_BULL / BULL` → **trend-following** mode (momentum entries, min 2 of 5 triggers)
+  - `CHOP / CAUTION` → **mean-reversion** mode (oversold dip-buying, relaxed daily thresholds)
+  - `BEAR` → no longs (shorts handled separately)
+- **Trend-following trigger set** — 5 new triggers: EMA20 pullback, 20-day breakout, higher-low pattern, momentum/RSI confirmation, golden cross
+- **Timeframe detection** (`_detect_timeframe`) — auto-selects thresholds for daily vs intraday data
+- **Relaxed daily thresholds** for mean-reversion — RSI 45 (not 40), Stochastic 35 (not 30), min 2-of-5 (not 3) for daily bars
+- **Core position logic** — bot now maintains base SPY/UPRO exposure in bullish regimes without waiting for oversold trigger (30% in STRONG_BULL, 20% in BULL, 10% in CHOP)
+- **Equal-dollar position sizing** — `AntiMartingaleScaler` now uses `allocated_capital` (70% of starting capital) for sizing, so each scale-in position is the same dollar size
+- **Regime distribution logging** — end-of-backtest summary shows days per regime and signal generation stats
+- **Performance metrics robustness** — Sharpe/Sortino/Calmar/Profit Factor now properly handle zero-variance returns (no -5e16 Sortino)
+- **Fixed 3 failing unit tests** — `test_max_positions_not_exceeded`, `test_sharpe_positive_returns`, `test_daily_halt_triggered`
+- **Added integration tests** — `TestBullBearChopBacktest`: bull must generate trades, bear must limit drawdown, chop must not blow up
+
 ## 🔧 Recent Fixes (v1.1)
 
 - **Fixed capital accounting in paper trader** — no more phantom profits on position close

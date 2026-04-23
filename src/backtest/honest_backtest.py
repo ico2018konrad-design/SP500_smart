@@ -209,10 +209,13 @@ def run_backtest(
     long_sig_gen = LongSignalGenerator(min_regime_score=8)
     short_sig_gen = ShortSignalGenerator(max_regime_score=5)
     position_mgr = PositionManager(max_positions=6)
+    # 70% of capital allocated to scaling positions, 30% reserved for hedge + buffer
+    allocated_scaling_capital = starting_capital * 0.70
     scaler = AntiMartingaleScaler(
         profit_threshold=0.01,
         min_hours_between=20.0,   # ~1 trading day minimum between scale-ins
         backtest_mode=True,
+        allocated_capital=allocated_scaling_capital,
     )
     exit_mgr = ExitManager()
     hedge = BaselineHedge(mode="mini", mini_hedge_pct=0.10)
@@ -223,6 +226,12 @@ def run_backtest(
     equity_curve = [capital]
     equity_dates = [spy.index[0]]
     trades = []
+
+    # Track regime distribution for logging
+    regime_counts: dict = {}
+    signals_generated = 0
+    entries_executed = 0
+    short_signals_generated = 0
 
     # Track open position costs for equity calculation (cash = capital only after debits)
     prev_regime: Regime = Regime.BULL
@@ -281,6 +290,10 @@ def run_backtest(
             regime = Regime.BULL
             regime_score = 8
             spy_above_200sma = True
+
+        # Track regime distribution
+        regime_label = regime.value if hasattr(regime, 'value') else str(regime)
+        regime_counts[regime_label] = regime_counts.get(regime_label, 0) + 1
 
         # ── 5. VALUATION GUARD ──────────────────────────────────────────────
         try:
@@ -359,12 +372,67 @@ def run_backtest(
             prev_equity = equity
             continue
 
-        # ── 9. GENERATE LONG SIGNALS ─────────────────────────────────────────
-        if regime in (Regime.STRONG_BULL, Regime.BULL) and not cb_status.is_halted():
+        # ── 9. CORE POSITION LOGIC (STRONG_BULL / BULL) ──────────────────────
+        # Maintain a base exposure in bullish regimes without waiting for a signal
+        core_target_pct = {
+            Regime.STRONG_BULL: 0.30,
+            Regime.BULL: 0.20,
+            Regime.CHOP: 0.10,
+            Regime.CAUTION: 0.0,
+            Regime.BEAR: 0.0,
+        }.get(regime, 0.0)
+
+        if core_target_pct > 0 and capital > 100:
+            core_instrument = "UPRO" if (regime == Regime.STRONG_BULL and effective_leverage >= 2.0) else "SPY"
+            has_core = any(
+                p.symbol == core_instrument and p.scale_number == 0
+                for p in position_mgr.get_open_positions()
+            )
+            if not has_core and position_mgr.can_add_position():
+                core_alloc = starting_capital * core_target_pct
+                core_price = current_prices.get(core_instrument, close_spy)
+                core_shares = max(1, int(core_alloc / core_price))
+                core_cost = core_shares * core_price * (1 + SLIPPAGE_PCT)
+                core_commission = core_cost * COMMISSION_PCT
+                if core_cost + core_commission <= capital * 0.95:
+                    core_stop = core_price * (1 - 0.03)  # 3×ATR approx wide stop
+                    core_pos = position_mgr.add_position(
+                        symbol=core_instrument,
+                        direction="LONG",
+                        entry_price=core_price * (1 + SLIPPAGE_PCT),
+                        shares=core_shares,
+                        stop_price=core_stop,
+                        target1=core_price * 1.06,
+                        target2=core_price * 1.12,
+                        target3=core_price * 1.20,
+                        scale_number=0,  # 0 = core position marker
+                    )
+                    if core_pos:
+                        capital -= core_cost + core_commission
+                        entries_executed += 1
+                        trades.append({
+                            "entry_date": str(date.date()),
+                            "exit_date": None,
+                            "instrument": core_instrument,
+                            "direction": "LONG",
+                            "entry_price": core_pos.entry_price,
+                            "exit_price": None,
+                            "shares": core_shares,
+                            "pnl": None,
+                            "reason": "core_position",
+                            "regime": regime_label,
+                            "_position_id": core_pos.position_id,
+                        })
+                        logger.info(
+                            "CORE position opened: %s %d @ %.2f (%s regime, %.0f%% alloc)",
+                            core_instrument, core_shares, core_pos.entry_price,
+                            regime_label, core_target_pct * 100,
+                        )
+
+        # ── 10. GENERATE LONG SIGNALS ─────────────────────────────────────────
+        if regime in (Regime.STRONG_BULL, Regime.BULL, Regime.CHOP, Regime.CAUTION) and not cb_status.is_halted():
             # Determine instrument: UPRO in strong bull w/ leverage >= 2, else SPY
             instrument = "UPRO" if (regime == Regime.STRONG_BULL and effective_leverage >= 2.0) else "SPY"
-            ema50_long = calc_ema(spy_slice["Close"], 50).iloc[-1]
-            spy_below_50sma = (not pd.isna(ema50_long)) and (close_spy < float(ema50_long))
 
             long_signal = long_sig_gen.generate(
                 symbol=instrument,
@@ -377,8 +445,7 @@ def run_backtest(
             )
 
             if long_signal:
-                stop_dist = max(atr_val * 1.5, close_spy * 0.015)
-                stop = long_signal.entry_price - stop_dist
+                signals_generated += 1
                 new_pos = scaler.execute_scale_in(
                     position_manager=position_mgr,
                     signal=long_signal,
@@ -388,6 +455,7 @@ def run_backtest(
                     backtest_time=date.to_pydatetime(),
                 )
                 if new_pos:
+                    entries_executed += 1
                     shares = new_pos.shares
                     fill = new_pos.entry_price
                     commission = shares * fill * COMMISSION_PCT
@@ -408,7 +476,7 @@ def run_backtest(
                         "_position_id": new_pos.position_id,
                     })
 
-        # ── 10. GENERATE SHORT SIGNALS ────────────────────────────────────────
+        # ── 11. GENERATE SHORT SIGNALS ────────────────────────────────────────
         elif regime in (Regime.BEAR,) and not cb_status.is_halted():
             ema50 = calc_ema(spy_slice["Close"], 50).iloc[-1]
             spy_below_50sma = not pd.isna(ema50) and close_spy < float(ema50)
@@ -427,6 +495,7 @@ def run_backtest(
             )
 
             if short_signal:
+                short_signals_generated += 1
                 new_pos = scaler.execute_scale_in(
                     position_manager=position_mgr,
                     signal=short_signal,
@@ -436,6 +505,7 @@ def run_backtest(
                     backtest_time=date.to_pydatetime(),
                 )
                 if new_pos:
+                    entries_executed += 1
                     shares = new_pos.shares
                     fill = new_pos.entry_price
                     commission = shares * fill * COMMISSION_PCT
@@ -454,7 +524,7 @@ def run_backtest(
                         "_position_id": new_pos.position_id,
                     })
 
-        # ── 11. EQUITY UPDATE ────────────────────────────────────────────────
+        # ── 12. EQUITY UPDATE ────────────────────────────────────────────────
         open_pos_value = sum(
             p.shares_open * current_prices.get(p.symbol, p.current_price)
             for p in position_mgr.get_open_positions()
@@ -491,13 +561,31 @@ def run_backtest(
         print(f"Final Equity:    ${metrics['end_equity']:,.0f}")
         print(f"Total Return:    {metrics['total_return']:.1%}")
         print(f"CAGR:            {metrics['cagr']:.1%}")
-        print(f"Sharpe Ratio:    {metrics['sharpe_ratio']:.2f}")
-        print(f"Sortino Ratio:   {metrics['sortino_ratio']:.2f}")
+        sharpe_val = metrics['sharpe_ratio']
+        print(f"Sharpe Ratio:    {'inf' if sharpe_val == float('inf') else f'{sharpe_val:.2f}'}")
+        sortino_val = metrics['sortino_ratio']
+        print(f"Sortino Ratio:   {'inf' if sortino_val == float('inf') else f'{sortino_val:.2f}'}")
         print(f"Max Drawdown:    {metrics['max_drawdown']:.1%}")
-        print(f"Calmar Ratio:    {metrics['calmar_ratio']:.2f}")
+        calmar_val = metrics['calmar_ratio']
+        print(f"Calmar Ratio:    {'inf' if calmar_val == float('inf') else f'{calmar_val:.2f}'}")
         print(f"Win Rate:        {metrics['win_rate']:.1%}")
-        print(f"Profit Factor:   {metrics['profit_factor']:.2f}")
+        pf_val = metrics['profit_factor']
+        print(f"Profit Factor:   {'inf' if pf_val == float('inf') else f'{pf_val:.2f}'}")
         print(f"Num Trades:      {metrics['num_trades']}")
+        print("=" * 60)
+
+        # Regime distribution summary
+        total_bars = sum(regime_counts.values()) or 1
+        print("\nRegime Distribution:")
+        for rname in ["STRONG_BULL", "BULL", "CHOP", "CAUTION", "BEAR"]:
+            count = regime_counts.get(rname, 0)
+            pct = count / total_bars * 100
+            print(f"  {rname:<12}: {count:5d} days ({pct:5.1f}%)")
+
+        print(f"\nSignal generation:")
+        print(f"  Long signals generated:  {signals_generated}")
+        print(f"  Long entries executed:   {entries_executed}")
+        print(f"  Short signals generated: {short_signals_generated}")
         print("=" * 60)
 
         # Save results
@@ -511,6 +599,12 @@ def run_backtest(
                 "slippage_pct": SLIPPAGE_PCT,
             },
             "metrics": metrics,
+            "regime_distribution": regime_counts,
+            "signal_stats": {
+                "long_signals_generated": signals_generated,
+                "long_entries_executed": entries_executed,
+                "short_signals_generated": short_signals_generated,
+            },
             "equity_curve": {
                 str(d.date()): float(v)
                 for d, v in zip(equity_dates, equity_curve)

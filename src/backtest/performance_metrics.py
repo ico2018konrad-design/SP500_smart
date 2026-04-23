@@ -27,12 +27,19 @@ def sharpe_ratio(
         risk_free_rate: Annual risk-free rate (default 5%)
         periods_per_year: Number of trading periods per year
     """
-    if returns.empty or returns.std() == 0:
+    if returns.empty:
         return 0.0
 
     daily_rf = risk_free_rate / periods_per_year
     excess_returns = returns - daily_rf
-    sharpe = np.sqrt(periods_per_year) * excess_returns.mean() / excess_returns.std()
+    std = excess_returns.std()
+    if pd.isna(std) or std < 1e-10:
+        if excess_returns.mean() > 0:
+            return float("inf")
+        elif excess_returns.mean() < 0:
+            return float("-inf")
+        return 0.0
+    sharpe = np.sqrt(periods_per_year) * excess_returns.mean() / std
     return float(sharpe)
 
 
@@ -49,10 +56,14 @@ def sortino_ratio(
     excess_returns = returns - daily_rf
     downside = excess_returns[excess_returns < 0]
 
-    if len(downside) == 0 or downside.std() == 0:
+    downside_std = downside.std()
+    if len(downside) == 0 or pd.isna(downside_std) or downside_std < 1e-10:
         return float("inf") if excess_returns.mean() > 0 else 0.0
 
-    sortino = np.sqrt(periods_per_year) * excess_returns.mean() / downside.std()
+    sortino = np.sqrt(periods_per_year) * excess_returns.mean() / downside_std
+    # Guard against extreme values from tiny denominators
+    if not np.isfinite(sortino) or abs(sortino) > 1e6:
+        return float("inf") if excess_returns.mean() > 0 else 0.0
     return float(sortino)
 
 
@@ -78,7 +89,8 @@ def calmar_ratio(
         return 0.0
 
     mdd = abs(max_drawdown(equity_series))
-    if mdd == 0:
+    if mdd < 1e-10:
+        # No drawdown — infinite Calmar, cap at a sane value
         return float("inf")
 
     years = len(equity_series) / TRADING_DAYS
@@ -86,9 +98,12 @@ def calmar_ratio(
         return 0.0
 
     total_return = (equity_series.iloc[-1] / equity_series.iloc[0]) - 1
-    cagr = (1 + total_return) ** (1 / years) - 1
+    cagr_val = (1 + total_return) ** (1 / years) - 1
 
-    return float(cagr / mdd)
+    result = cagr_val / mdd
+    if not np.isfinite(result) or abs(result) > 1e6:
+        return float("inf") if cagr_val > 0 else 0.0
+    return float(result)
 
 
 def cagr(equity_series: pd.Series) -> float:

@@ -69,29 +69,85 @@ if months_since_last_10pct_correction > 18: penalty *= 0.70
 final_leverage = base_leverage * penalty
 ```
 
-## 6. LONG Entry Signals (3-Level Check)
+## 6. LONG Entry Signals — ADAPTIVE MODE (v1.2)
+
+### Signal Mode Selection (automatic, based on regime)
+
+```
+STRONG_BULL / BULL  →  TREND-FOLLOW mode   (momentum/continuation entries)
+CHOP / CAUTION      →  MEAN-REVERT mode    (oversold dip-buying entries)
+BEAR                →  No longs (shorts handled separately)
+```
 
 **Level 1 — SETUP (ALL required)**
-- Regime score >= 8
+- Regime score >= 8 (CHOP/CAUTION: >= 6)
 - SPY > 200 SMA
 - No major event in 24h (FOMC, CPI, NFP)
 - ATR(14) < 3% (not chaotic)
 - No opposing SHORT position open
 
-**Level 2 — TRIGGER (min 3 of 5)**
-1. RSI(14) 1H < 40, crossing up
+---
+
+### TREND-FOLLOW Triggers (STRONG_BULL / BULL)
+
+**Level 2 — TRIGGER (min 2 of 5)**
+1. Pullback to 20 EMA in uptrend: `close between 20EMA×0.99 and 20EMA×1.02 AND 20EMA > 50EMA`
+2. Breakout above 20-day high: `close > max(close[-20:-1]) AND green candle`
+3. Higher-low pattern: recent swing low > previous swing low in 20-bar window, currently bouncing
+4. Momentum confirmation: 5d return > 1% AND RSI(14) in 50-70 range (healthy, not exhausted)
+5. Golden cross / above both EMAs: `50EMA > 200EMA AND close > 50EMA AND close > 200EMA`
+
+**Level 3 — CONFIRMATION (min 1 of 3, relaxed)**
+1. Volume > 1.1x 20-bar avg
+2. Higher close than previous 3 days
+3. Breadth indicator rising
+
+---
+
+### MEAN-REVERT Triggers (CHOP / CAUTION)
+
+**Level 2 — TRIGGER (min 2 of 5 daily, min 3 of 5 intraday)**
+
+Thresholds auto-adjusted for timeframe:
+- **Daily**: RSI threshold 45, Stochastic threshold 35
+- **Intraday**: RSI threshold 40, Stochastic threshold 30
+
+1. RSI below threshold, crossing up
 2. Price touches 50 EMA and bounces
-3. MACD histogram rising (from negative)
-4. Stochastic(14,3,3) < 30, bullish cross
+3. MACD histogram rising from negative
+4. Stochastic below threshold, bullish cross (%K > %D)
 5. Bollinger Band lower touch + green candle
 
 **Level 3 — CONFIRMATION (min 2 of 4)**
 1. Volume > 1.3x 20-bar avg
-2. Price above VWAP (5min)
-3. A/D line rising
-4. TICK index > +500 NYSE
+2. Price above VWAP
+3. A/D line rising (proxy)
+4. TICK index > +500 NYSE (proxy)
 
 **Asymmetric R:R**: Stop -1.5%, T1 +2%, T2 +4.5%, T3 +8%. Min R:R 1:2.0.
+
+---
+
+### Timeframe Detection
+
+The signal generator auto-detects whether data is **intraday** (bar gap < 1 day) or **daily** (gap >= 1 day) and adjusts trigger thresholds accordingly. This ensures correct behavior whether running on live 1H bars or historical daily bars.
+
+---
+
+### Core Position Concept (v1.2)
+
+In bullish regimes, the bot maintains a **base exposure** without waiting for a trigger signal:
+
+| Regime | Core % | Instrument |
+|--------|--------|------------|
+| STRONG_BULL (leverage>=2) | 30% | UPRO |
+| STRONG_BULL (leverage<2) | 30% | SPY |
+| BULL | 20% | SPY |
+| CHOP | 10% | SPY |
+| CAUTION/BEAR | 0% | — |
+
+Core positions use scale_number=0 (distinguished from scaled positions 1-6) and wider stops (3×ATR).
+
 
 ## 7. SHORT Entry Signals
 
@@ -105,7 +161,10 @@ Execute SHORT via SPXS or SH — NOT naked short. Size 1/3 of normal long. R:R m
 
 ## 8. Scale-in Logic (Anti-Martingale)
 
-Max 6 positions, each 16.67% of allocated capital.
+Max 6 positions, each 16.67% of **allocated capital** (70% of starting capital reserved for scaled positions; 30% for hedge + cash buffer).
+
+**Equal-dollar sizing**: Position size is calculated from the initial allocated capital, not current cash. This ensures Position #6 is the same dollar size as Position #1, not degraded by prior trades.
+
 **New position ONLY when previous is +1% in profit** (never averaging down).
 
 ```

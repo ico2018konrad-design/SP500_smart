@@ -31,7 +31,9 @@ class Position:
     status: PositionStatus = PositionStatus.OPEN
 
     # Scaling info
-    scale_number: int = 1   # 1-6
+    # scale_number=0 → core position (base exposure, not part of scale-in pyramid)
+    # scale_number=1-6 → scaled positions from AntiMartingaleScaler
+    scale_number: int = 1   # 0=core, 1-6=scaled
 
     # Target hit tracking
     target1_hit: bool = False

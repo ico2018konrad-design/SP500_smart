@@ -98,15 +98,17 @@ class CircuitBreakers:
         """
         today = date.today()
 
-        # Initialize tracking if needed
-        if self._daily_start_equity is None:
-            self._daily_start_equity = current_equity
-            self._weekly_start_equity = current_equity
-            self._monthly_peak_equity = current_equity
+        # Initialize tracking if needed — preserve any manually-set values
+        if self._last_reset_date is None:
             self._last_reset_date = today
-
-        # Daily reset
-        if self._last_reset_date != today:
+            if self._daily_start_equity is None:
+                self._daily_start_equity = current_equity
+            if self._weekly_start_equity is None:
+                self._weekly_start_equity = current_equity
+            if self._monthly_peak_equity is None:
+                self._monthly_peak_equity = current_equity
+        elif self._last_reset_date != today:
+            # New trading day — reset daily tracking
             self._daily_start_equity = current_equity
             self.status.daily_halt = False  # Reset daily halt
             self.status.daily_pnl_pct = 0.0
