@@ -123,9 +123,9 @@ class PaperTrader:
             logger.warning("Position size is 0 for %s — insufficient capital?", symbol)
             return None
 
-        # Commission cost
+        # Debit full position cost + commission from capital on open
         commission = shares * fill_price * self.commission_pct
-        self.capital -= commission
+        self.capital -= shares * fill_price + commission
 
         # Create and fill order
         action = "BUY" if direction == "LONG" else "SELL"
@@ -180,28 +180,28 @@ class PaperTrader:
         else:
             fill_price = current_price * (1 + self.slippage_pct)
 
-        # Commission
-        commission = pos.shares_open * fill_price * self.commission_pct
-        self.capital -= commission
+        shares_open = pos.shares_open
 
         pnl_pct = self.position_manager.close_position(position_id, fill_price, reason)
 
         if pnl_pct is not None:
-            pnl_dollar = pnl_pct * pos.shares * pos.entry_price
-            self.capital += pnl_dollar + pos.shares * pos.entry_price
+            # Credit the sale proceeds minus commission (cost was debited on open)
+            commission = shares_open * fill_price * self.commission_pct
+            self.capital += shares_open * fill_price - commission
             self._log_trade("CLOSE", pos.symbol, pos.direction, pos.shares, fill_price, reason=reason, pnl_pct=pnl_pct)
 
         return pnl_pct
 
     def get_equity(self) -> float:
-        """Get current portfolio equity."""
+        """Get current portfolio equity (cash + mark-to-market open positions)."""
         equity = self.capital
         for pos in self.position_manager.get_open_positions():
             current_price = self.get_current_price(pos.symbol) or pos.current_price
             if pos.direction == "LONG":
-                equity += pos.shares_open * (current_price - pos.entry_price)
+                equity += pos.shares_open * current_price
             else:
-                equity += pos.shares_open * (pos.entry_price - current_price)
+                # For short positions: we received proceeds at entry, now owe current_price
+                equity -= pos.shares_open * current_price
         return equity
 
     def _log_trade(

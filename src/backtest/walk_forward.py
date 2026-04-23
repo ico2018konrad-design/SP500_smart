@@ -1,7 +1,14 @@
-"""Walk-Forward Validation — 16-window out-of-sample testing.
+"""Rolling Out-of-Sample Validation — 16-window consecutive OOS testing.
 
-Each window: 3-year training, 1-year test, sliding 1 year at a time.
+Each window: 1-year out-of-sample test, sliding 1 year at a time.
+No parameter optimization is performed on the training period (honest OOS naming).
+
+To add true walk-forward with parameter optimization, see TODO in code.
 Reports Sharpe/MDD per window.
+
+Note: Previously named run_walk_forward(). Renamed to run_rolling_oos_validation()
+to reflect that no in-sample parameter tuning occurs — these are purely
+consecutive 1-year out-of-sample tests.
 """
 import json
 import logging
@@ -20,19 +27,26 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def run_walk_forward(
+def run_rolling_oos_validation(
     full_start: str = "2005-01-01",
     full_end: str = "2025-12-31",
     train_years: int = 3,
     test_years: int = 1,
     starting_capital: float = 5000.0,
 ) -> dict:
-    """Run 16-window walk-forward validation.
+    """Run 16-window rolling out-of-sample validation.
+
+    Runs consecutive 1-year OOS tests without parameter optimization.
+    The 'train_years' parameter is recorded for documentation purposes only —
+    no in-sample optimization is performed (honest OOS).
+
+    TODO (walk-forward v2): Add grid-search over min_regime_score, stop_pct,
+    profit_threshold on the train period, then apply best params to test period.
 
     Args:
         full_start: Start of full data range
         full_end: End of full data range
-        train_years: Training window size in years
+        train_years: Training window size in years (recorded but not used for optimization)
         test_years: Test window size in years
         starting_capital: Starting capital per window
 
@@ -40,8 +54,8 @@ def run_walk_forward(
         Dict with results per window + aggregate stats
     """
     logger.info(
-        "Walk-forward validation: %d-year train, %d-year test",
-        train_years, test_years
+        "Rolling OOS validation: %d-year test windows (no train-period optimization)",
+        test_years
     )
 
     windows = []
@@ -143,7 +157,8 @@ def run_walk_forward(
     }
 
     print("\n" + "=" * 60)
-    print("WALK-FORWARD VALIDATION RESULTS")
+    print("ROLLING OOS VALIDATION RESULTS")
+    print("(No parameter optimization — pure out-of-sample)")
     print("=" * 60)
     for r in results:
         print(
@@ -168,5 +183,14 @@ def run_walk_forward(
     return output
 
 
+# Backward-compatible alias
+def run_walk_forward(**kwargs) -> dict:
+    """Backward-compatible alias for run_rolling_oos_validation().
+
+    Deprecated: use run_rolling_oos_validation() directly.
+    """
+    return run_rolling_oos_validation(**kwargs)
+
+
 if __name__ == "__main__":
-    run_walk_forward()
+    run_rolling_oos_validation()

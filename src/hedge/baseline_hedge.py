@@ -119,6 +119,91 @@ class BaselineHedge:
         """
         return abs(current_hedge_pct - target_hedge_pct) > tolerance
 
+    def rebalance(
+        self,
+        paper_trader,
+        current_prices: dict,
+        current_capital: float,
+        drift_tolerance: float = 0.10,
+    ) -> bool:
+        """Submit orders to rebalance hedge to target allocation.
+
+        Called daily after market close, or when drift > tolerance.
+
+        Args:
+            paper_trader: PaperTrader instance for order execution
+            current_prices: Dict of {symbol: price}
+            current_capital: Current total capital
+            drift_tolerance: Rebalance if hedge drifts more than this fraction
+
+        Returns:
+            True if rebalance was executed, False otherwise
+        """
+        sh_price = current_prices.get("SH")
+        if not sh_price or sh_price <= 0:
+            logger.debug("SH price not available — skipping hedge rebalance")
+            return False
+
+        target_hedge_value = current_capital * self.mini_hedge_pct
+
+        # Find existing SH position
+        current_sh_position = next(
+            (p for p in paper_trader.position_manager.get_open_positions()
+             if p.symbol == "SH"),
+            None,
+        )
+        current_hedge_value = (
+            current_sh_position.shares_open * sh_price
+            if current_sh_position else 0.0
+        )
+
+        if target_hedge_value <= 0:
+            return False
+
+        drift = abs(current_hedge_value - target_hedge_value) / target_hedge_value
+        if drift <= drift_tolerance:
+            logger.debug(
+                "Hedge drift %.1f%% within tolerance — no rebalance needed",
+                drift * 100,
+            )
+            return False
+
+        logger.info(
+            "Hedge rebalance: current=$%.0f target=$%.0f drift=%.1f%%",
+            current_hedge_value, target_hedge_value, drift * 100,
+        )
+
+        # Close existing SH if it exists
+        if current_sh_position:
+            paper_trader.close_position(
+                current_sh_position.position_id,
+                reason="hedge_rebalance",
+                current_prices=current_prices,
+            )
+
+        # Open new SH position at target size
+        from src.signals.signal_types import Signal, SignalDirection
+        target_shares = max(0, int(target_hedge_value / sh_price))
+        if target_shares <= 0:
+            return False
+
+        hedge_signal = Signal(
+            direction=SignalDirection.LONG,
+            symbol="SH",
+            entry_price=sh_price,
+            stop_price=sh_price * 0.85,   # wide stop for hedge
+            target1=sh_price * 1.05,
+            target2=sh_price * 1.10,
+            target3=sh_price * 1.15,
+            regime_score=5,
+            regime="HEDGE",
+        )
+
+        # Use a fixed shares override: bypass normal sizing by adjusting capital
+        allocated = target_shares * sh_price / self.mini_hedge_pct
+        pos = paper_trader.execute_signal(hedge_signal, allocated_capital=allocated)
+        return pos is not None
+
     def get_put_spread_strikes(self, spy_price: float) -> dict:
         """Calculate put spread strikes for full mode.
 

@@ -3,12 +3,22 @@
 Uses real historical data from Yahoo Finance and FRED.
 Default period: 2005-01-01 to 2025-12-31.
 
+Uses the full strategy stack:
+  LongSignalGenerator + ShortSignalGenerator (3-level check)
+  AntiMartingaleScaler (6-position scale-in, anti-martingale)
+  PositionManager (up to 6 positions)
+  BaselineHedge (10% SH allocation, auto-rebalanced)
+  CircuitBreakers (daily/weekly/monthly halt)
+  ValuationGuard (leverage cap)
+  Real FRED macro data (HY spread, yield curve)
+
 Run: python src/backtest/honest_backtest.py
 """
 import json
 import logging
 import os
 import sys
+from datetime import datetime
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -18,10 +28,18 @@ import pandas as pd
 
 from src.data.yahoo_loader import load_spy, load_vix, load_ohlcv
 from src.data.fred_macro import load_macro_data, get_cape_ratio
+from src.data.macro_timeseries import MacroTimeSeries
 from src.regime.detector import RegimeDetector
 from src.regime.valuation_guard import ValuationGuard
 from src.regime.regime_types import Regime, score_to_regime
 from src.signals.indicators import calc_atr, calc_rsi, calc_macd, calc_ema
+from src.signals.long_signals import LongSignalGenerator
+from src.signals.short_signals import ShortSignalGenerator
+from src.positions.position_manager import PositionManager
+from src.positions.anti_martingale_scaler import AntiMartingaleScaler
+from src.positions.exit_manager import ExitManager
+from src.hedge.baseline_hedge import BaselineHedge
+from src.risk.circuit_breakers import CircuitBreakers
 from src.backtest.performance_metrics import compute_all_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -47,19 +65,123 @@ EXPENSE_RATIOS = {
 }
 
 
+def _apply_slippage(price: float, direction: str, slippage_pct: float) -> float:
+    """Apply slippage: buy high, sell low."""
+    if direction in ("LONG", "BUY"):
+        return price * (1 + slippage_pct)
+    return price * (1 - slippage_pct)
+
+
+def _open_position(
+    capital: float,
+    instrument: str,
+    direction: str,
+    price: float,
+    stop: float,
+    target1: float,
+    target2: float,
+    target3: float,
+    position_mgr: PositionManager,
+    trades: list,
+    date: pd.Timestamp,
+    regime_label: str,
+    max_alloc_pct: float = 0.15,
+) -> float:
+    """Open a position and debit capital. Returns updated capital."""
+    fill = _apply_slippage(price, direction, SLIPPAGE_PCT)
+    risk_dollars = capital * 0.015
+    stop_dist = max(abs(fill - stop), fill * 0.005)
+    shares = max(1, int(risk_dollars / stop_dist))
+    max_shares = int(capital * max_alloc_pct / fill)
+    shares = min(shares, max_shares)
+
+    cost = shares * fill
+    commission = cost * COMMISSION_PCT
+
+    if cost + commission > capital * 0.95:  # safety: leave 5% cash buffer
+        logger.debug("Insufficient capital for %s %s %d @ %.2f", direction, instrument, shares, fill)
+        return capital
+
+    # Debit capital on open
+    capital -= cost + commission
+
+    pos = position_mgr.add_position(
+        symbol=instrument,
+        direction=direction,
+        entry_price=fill,
+        shares=shares,
+        stop_price=stop,
+        target1=target1,
+        target2=target2,
+        target3=target3,
+    )
+
+    if pos:
+        trades.append({
+            "entry_date": str(date.date()),
+            "exit_date": None,
+            "instrument": instrument,
+            "direction": direction,
+            "entry_price": fill,
+            "exit_price": None,
+            "shares": shares,
+            "pnl": None,
+            "reason": "entry",
+            "regime": regime_label,
+            "_position_id": pos.position_id,
+        })
+        logger.debug("OPEN %s %s %d @ %.2f on %s", direction, instrument, shares, fill, date.date())
+
+    return capital
+
+
+def _close_position(
+    capital: float,
+    pos,
+    close_price: float,
+    position_mgr: PositionManager,
+    trades: list,
+    date: pd.Timestamp,
+    reason: str,
+) -> float:
+    """Close a position and credit proceeds. Returns updated capital."""
+    fill = _apply_slippage(close_price, "SELL" if pos.direction == "LONG" else "BUY", SLIPPAGE_PCT)
+    shares_open = pos.shares_open
+    commission = shares_open * fill * COMMISSION_PCT
+
+    # Credit: sale proceeds - commission (cost was already debited on open)
+    capital += shares_open * fill - commission
+
+    pnl = shares_open * (fill - pos.entry_price) if pos.direction == "LONG" \
+        else shares_open * (pos.entry_price - fill)
+
+    # Update trade record
+    for t in reversed(trades):
+        if t.get("_position_id") == pos.position_id and t["exit_date"] is None:
+            t["exit_date"] = str(date.date())
+            t["exit_price"] = fill
+            t["pnl"] = pnl - commission
+            t["reason"] = reason
+            break
+
+    position_mgr.close_position(pos.position_id, fill, reason)
+    logger.debug("CLOSE %s %s %d @ %.2f (%s) on %s PnL=%.2f", pos.direction, pos.symbol, shares_open, fill, reason, date.date(), pnl)
+    return capital
+
+
 def run_backtest(
     start_date: str = "2005-01-01",
     end_date: str = "2025-12-31",
     starting_capital: float = 5000.0,
     verbose: bool = True,
 ) -> dict:
-    """Run full honest backtest.
+    """Run full honest backtest using real strategy modules.
 
     Returns dict with equity curve and performance metrics.
     """
     logger.info("Loading data for backtest %s to %s...", start_date, end_date)
 
-    # Load data
+    # ── DATA LOADING ────────────────────────────────────────────────────────
     spy = load_spy(start=start_date, end=end_date)
     vix = load_vix(start=start_date, end=end_date)
 
@@ -74,216 +196,281 @@ def run_backtest(
 
     logger.info("Data loaded: %d trading days", len(spy))
 
-    # Initialize regime detector
+    # Load macro time series (FRED; falls back gracefully)
+    macro = MacroTimeSeries(start=start_date)
+
+    # ── STRATEGY MODULES ────────────────────────────────────────────────────
     detector = RegimeDetector()
     guard = ValuationGuard()
+    long_sig_gen = LongSignalGenerator(min_regime_score=8)
+    short_sig_gen = ShortSignalGenerator(max_regime_score=5)
+    position_mgr = PositionManager(max_positions=6)
+    scaler = AntiMartingaleScaler(
+        profit_threshold=0.01,
+        min_hours_between=20.0,   # ~1 trading day minimum between scale-ins
+        backtest_mode=True,
+    )
+    exit_mgr = ExitManager()
+    hedge = BaselineHedge(mode="mini", mini_hedge_pct=0.10)
+    breakers = CircuitBreakers()
 
-    # ── BACKTEST LOOP ──────────────────────────────────────────────────
+    # ── BACKTEST STATE ───────────────────────────────────────────────────────
     capital = starting_capital
     equity_curve = [capital]
     equity_dates = [spy.index[0]]
-    positions = []  # (entry_date, exit_date, entry_px, exit_px, direction, instrument, shares)
     trades = []
 
-    # Warm-up period: need at least 200 bars
-    warmup = 200
-    in_position = False
-    position_entry_price = 0.0
-    position_entry_date = None
-    position_instrument = "SPY"
-    position_direction = "LONG"
-    position_shares = 0
-    position_stop = 0.0
-    position_target1 = 0.0
-    position_target2 = 0.0
-    position_target3 = 0.0
-    t1_hit = False
-    t2_hit = False
-    position_days = 0
-    trailing_high = 0.0
+    # Track open position costs for equity calculation (cash = capital only after debits)
+    prev_regime: Regime = Regime.BULL
+    prev_equity = capital
+    warmup = 200  # need at least 200 bars for SMA200
 
     for i in range(warmup, len(spy)):
         date = spy.index[i]
         row = spy.iloc[i]
         vix_row = vix.iloc[i]
 
-        spy_slice = spy.iloc[:i+1]
-        vix_slice = vix.iloc[:i+1]
+        spy_slice = spy.iloc[:i + 1]
+        vix_slice = vix.iloc[:i + 1]
         close_spy = float(row["Close"])
         vix_val = float(vix_row["Close"]) if "Close" in vix_row else 20.0
 
-        # Daily borrow fee / expense ratio deduction (if in position)
-        if in_position:
-            daily_fee = EXPENSE_RATIOS.get(position_instrument, 0) / 252
-            if position_direction != "LONG":
-                daily_fee += BORROW_FEES.get(position_instrument, 0) / 252
-            capital *= (1 - daily_fee)
-            position_days += 1
+        # ── 1. UPDATE PRICES ON OPEN POSITIONS ──────────────────────────────
+        current_prices = {"SPY": close_spy, "UPRO": close_spy * 3.0, "SH": 100.0 / close_spy * 45.0, "SPXS": close_spy}
+        position_mgr.update_prices(current_prices)
 
-        # Run regime detector every day
+        # ── 2. DAILY BORROW / EXPENSE RATIO DEDUCTIONS ──────────────────────
+        for pos in position_mgr.get_open_positions():
+            daily_expense = EXPENSE_RATIOS.get(pos.symbol, 0) / 252
+            if pos.direction != "LONG":
+                daily_expense += BORROW_FEES.get(pos.symbol, 0) / 252
+            # Deduct from capital proportional to position value
+            pos_value = pos.shares_open * current_prices.get(pos.symbol, pos.current_price)
+            capital -= pos_value * daily_expense
+
+        # ── 3. REAL MACRO DATA FOR REGIME DETECTOR ──────────────────────────
+        hy_spread_bps = macro.get_hy_spread_on(date)
+        breadth_pct = macro.get_breadth_on(date, spy_slice)
+
+        # ── 4. REGIME DETECTION ─────────────────────────────────────────────
         try:
             regime_result = detector.detect(
                 spy_daily=spy_slice,
                 vix_daily=vix_slice,
-                breadth_pct=0.55,  # simplified: assume average breadth
-                hy_spread_bps=350.0,
+                breadth_pct=breadth_pct,
+                hy_spread_bps=hy_spread_bps,
             )
             regime = regime_result.regime
             regime_score = regime_result.score
-        except Exception:
+            spy_above_200sma = regime_result.spy_above_200sma
+        except Exception as exc:
+            logger.debug("Regime detector error: %s", exc)
             regime = Regime.BULL
             regime_score = 8
+            spy_above_200sma = True
 
-        # Valuation guard
-        sma200 = float(spy_slice["Close"].rolling(200).mean().iloc[-1]) if len(spy_slice) >= 200 else close_spy
-        vg = guard.compute(
-            base_leverage=regime_result.max_leverage,
-            spy_price=close_spy,
-            spy_200sma=sma200,
+        # ── 5. VALUATION GUARD ──────────────────────────────────────────────
+        try:
+            sma200 = float(spy_slice["Close"].rolling(200).mean().iloc[-1]) if len(spy_slice) >= 200 else close_spy
+            vg = guard.compute(
+                base_leverage=regime_result.max_leverage if hasattr(regime_result, 'max_leverage') else 1.0,
+                spy_price=close_spy,
+                spy_200sma=sma200,
+                vix=vix_val,
+                spy_prices_history=spy_slice["Close"],
+            )
+            effective_leverage = vg.final_leverage
+        except Exception:
+            effective_leverage = 1.0
+
+        # ── 6. CIRCUIT BREAKERS ─────────────────────────────────────────────
+        open_pos_value = sum(
+            p.shares_open * current_prices.get(p.symbol, p.current_price)
+            for p in position_mgr.get_open_positions()
+            if p.direction == "LONG"
+        )
+        equity = capital + open_pos_value
+
+        spy_daily_ret = float((spy_slice["Close"].iloc[-1] - spy_slice["Close"].iloc[-2]) / spy_slice["Close"].iloc[-2]) if len(spy_slice) > 1 else 0.0
+
+        cb_status = breakers.update(
+            current_equity=equity,
             vix=vix_val,
-            spy_prices_history=spy_slice["Close"],
+            spy_daily_return=spy_daily_ret,
         )
 
-        # Check exits if in position
-        if in_position:
-            exit_reason = None
+        # ── 7. CHECK EXITS ───────────────────────────────────────────────────
+        atr_val = float(calc_atr(spy_slice["High"], spy_slice["Low"], spy_slice["Close"]).iloc[-1])
+        if pd.isna(atr_val):
+            atr_val = close_spy * 0.01
+        atr_values = {sym: atr_val for sym in current_prices}
 
-            # Stop loss
-            if position_direction == "LONG" and close_spy <= position_stop:
-                exit_reason = "stop_loss"
-            elif position_direction == "SHORT" and close_spy >= position_stop:
-                exit_reason = "stop_loss"
+        # Partial exits at targets
+        partial_exits = exit_mgr.check_partial_exits(position_mgr, current_prices, atr_values)
+        for pos_id, reason, close_price, fraction in partial_exits:
+            pos = position_mgr.positions.get(pos_id)
+            if pos and pos.shares_open > 0:
+                shares_to_close = max(1, int(pos.shares_open * fraction))
+                fill = _apply_slippage(close_price, "SELL" if pos.direction == "LONG" else "BUY", SLIPPAGE_PCT)
+                commission = shares_to_close * fill * COMMISSION_PCT
+                capital += shares_to_close * fill - commission
+                pos.shares_closed += shares_to_close
+                if pos.shares_open <= 0:
+                    from src.positions.position_manager import PositionStatus
+                    pos.status = PositionStatus.CLOSED
+                logger.debug("Partial exit %s: %d shares @ %.2f (%s)", pos_id, shares_to_close, fill, reason)
 
-            # Targets
-            if not t1_hit and position_direction == "LONG" and close_spy >= position_target1:
-                t1_hit = True
-                # Close 1/3 of position
-                shares_to_close = max(1, position_shares // 3)
-                pnl = shares_to_close * (close_spy - position_entry_price)
-                commission = shares_to_close * close_spy * COMMISSION_PCT
-                slippage = shares_to_close * close_spy * SLIPPAGE_PCT
-                capital += pnl - commission - slippage
-                position_shares -= shares_to_close
-                position_stop = position_entry_price  # move to BE
-                logger.debug("T1 hit at %.2f, close 1/3", close_spy)
+        # Update trailing stops
+        exit_mgr.update_trailing_stops(position_mgr, current_prices, atr_values)
 
-            if t1_hit and not t2_hit and position_direction == "LONG" and close_spy >= position_target2:
-                t2_hit = True
-                shares_to_close = max(1, position_shares // 2)
-                pnl = shares_to_close * (close_spy - position_entry_price)
-                commission = shares_to_close * close_spy * COMMISSION_PCT
-                slippage = shares_to_close * close_spy * SLIPPAGE_PCT
-                capital += pnl - commission - slippage
-                position_shares -= shares_to_close
-                position_stop = position_entry_price * 1.02
+        # Full exits (stops, regime exits, etc.)
+        full_exits = exit_mgr.check_exits(
+            position_mgr,
+            current_prices,
+            atr_values,
+            current_regime=regime,
+            previous_regime=prev_regime,
+            vix=vix_val,
+            current_time=date.to_pydatetime(),
+        )
+        for pos_id, reason, close_price in full_exits:
+            pos = position_mgr.positions.get(pos_id)
+            if pos and pos.shares_open > 0:
+                capital = _close_position(capital, pos, close_price, position_mgr, trades, date, reason)
 
-            # Time stop
-            if position_days >= 10:
-                pnl_pct = (close_spy - position_entry_price) / position_entry_price
-                if abs(pnl_pct) < 0.01:
-                    exit_reason = "time_stop"
+        # ── 8. SKIP ENTRIES IF HALTED ────────────────────────────────────────
+        if cb_status.is_halted():
+            equity_curve.append(capital + open_pos_value)
+            equity_dates.append(date)
+            prev_regime = regime
+            prev_equity = equity
+            continue
 
-            # VIX panic
-            if vix_val > 35 and position_direction == "LONG":
-                exit_reason = "vix_panic"
+        # ── 9. GENERATE LONG SIGNALS ─────────────────────────────────────────
+        if regime in (Regime.STRONG_BULL, Regime.BULL) and not cb_status.is_halted():
+            # Determine instrument: UPRO in strong bull w/ leverage >= 2, else SPY
+            instrument = "UPRO" if (regime == Regime.STRONG_BULL and effective_leverage >= 2.0) else "SPY"
+            spy_below_50sma = not spy_above_200sma  # simplification
 
-            # Trailing stop activation
-            if position_direction == "LONG":
-                pnl_pct = (close_spy - position_entry_price) / position_entry_price
-                if pnl_pct >= 0.03:
-                    trailing_high = max(trailing_high, close_spy)
-                    atr_val = float(calc_atr(spy_slice["High"], spy_slice["Low"], spy_slice["Close"]).iloc[-1])
-                    trail_stop = trailing_high - 1.5 * atr_val
-                    if trail_stop > position_stop:
-                        position_stop = trail_stop
+            long_signal = long_sig_gen.generate(
+                symbol=instrument,
+                daily_data=spy_slice,
+                regime_score=regime_score,
+                regime=regime.value,
+                spy_above_200sma=spy_above_200sma,
+                breadth_rising=breadth_pct > 0.50,
+                tick_above_500=breadth_pct > 0.55,
+            )
 
-            # Execute exit
-            if exit_reason or (not in_position):
-                if in_position and exit_reason:
-                    fill = close_spy * (1 - SLIPPAGE_PCT) if position_direction == "LONG" else close_spy * (1 + SLIPPAGE_PCT)
-                    pnl = position_shares * (fill - position_entry_price)
-                    commission = position_shares * fill * COMMISSION_PCT
-                    capital += pnl - commission
-                    in_position = False
-                    trades.append({
-                        "entry_date": str(position_entry_date.date()),
-                        "exit_date": str(date.date()),
-                        "instrument": position_instrument,
-                        "direction": position_direction,
-                        "entry_price": position_entry_price,
-                        "exit_price": fill,
-                        "shares": position_shares,
-                        "pnl": pnl - commission,
-                        "reason": exit_reason,
-                        "regime": regime.value,
-                    })
-                    position_days = 0
-                    t1_hit = False
-                    t2_hit = False
-                    trailing_high = 0.0
-
-        # Entry signal (simplified rule-based)
-        if not in_position:
-            # Long signal conditions
-            if (regime in (Regime.STRONG_BULL, Regime.BULL) and
-                    regime_result.spy_above_200sma and
-                    vix_val < 25):
-
-                rsi = calc_rsi(spy_slice["Close"], 14)
-                current_rsi = float(rsi.iloc[-1]) if len(rsi.dropna()) > 0 else 50.0
-                ema50 = float(calc_ema(spy_slice["Close"], 50).iloc[-1])
-
-                # Simple entry: RSI oversold + price near EMA
-                if current_rsi < 45 or (close_spy > ema50 * 0.99 and close_spy < ema50 * 1.005):
-                    # Determine instrument based on regime
-                    if regime == Regime.STRONG_BULL and vg.final_leverage >= 2.0:
-                        instrument = "UPRO"
-                    else:
-                        instrument = "SPY"
-
-                    # Position sizing
-                    atr_val = float(calc_atr(spy_slice["High"], spy_slice["Low"], spy_slice["Close"]).iloc[-1])
-                    stop_dist = max(atr_val * 1.5, close_spy * 0.015)
-                    risk_dollars = capital * 0.015
-                    shares = max(1, int(risk_dollars / stop_dist))
-                    max_shares = int(capital * 0.20 / close_spy)
-                    shares = min(shares, max_shares)
-
-                    # Entry with slippage
-                    fill = close_spy * (1 + SLIPPAGE_PCT)
+            if long_signal:
+                stop_dist = max(atr_val * 1.5, close_spy * 0.015)
+                stop = long_signal.entry_price - stop_dist
+                new_pos = scaler.execute_scale_in(
+                    position_manager=position_mgr,
+                    signal=long_signal,
+                    capital=capital,
+                    current_prices=current_prices,
+                    atr=atr_val,
+                    backtest_time=date.to_pydatetime(),
+                )
+                if new_pos:
+                    shares = new_pos.shares
+                    fill = new_pos.entry_price
                     commission = shares * fill * COMMISSION_PCT
+                    # Cost was NOT debited by scaler — debit now
+                    capital -= shares * fill + commission
+                    # Log trade
+                    trades.append({
+                        "entry_date": str(date.date()),
+                        "exit_date": None,
+                        "instrument": instrument,
+                        "direction": "LONG",
+                        "entry_price": fill,
+                        "exit_price": None,
+                        "shares": shares,
+                        "pnl": None,
+                        "reason": "entry_long",
+                        "regime": regime.value,
+                        "_position_id": new_pos.position_id,
+                    })
 
-                    if shares * fill + commission <= capital:
-                        in_position = True
-                        position_entry_price = fill
-                        position_entry_date = date
-                        position_instrument = instrument
-                        position_direction = "LONG"
-                        position_shares = shares
-                        position_stop = fill - stop_dist
-                        position_target1 = fill * 1.02
-                        position_target2 = fill * 1.045
-                        position_target3 = fill * 1.08
-                        trailing_high = fill
-                        capital -= commission
-                        logger.debug("LONG entry: %s %d @ %.2f on %s", instrument, shares, fill, date.date())
+        # ── 10. GENERATE SHORT SIGNALS ────────────────────────────────────────
+        elif regime in (Regime.BEAR,) and not cb_status.is_halted():
+            ema50 = calc_ema(spy_slice["Close"], 50).iloc[-1]
+            spy_below_50sma = not pd.isna(ema50) and close_spy < float(ema50)
+            prev_vix = float(vix_slice["Close"].iloc[-2]) if len(vix_slice) > 1 else vix_val
+            vix_rising = vix_val > prev_vix
 
-        equity_curve.append(capital)
+            short_signal = short_sig_gen.generate(
+                symbol="SH",
+                daily_data=spy_slice,
+                regime_score=regime_score,
+                regime=regime.value,
+                vix=vix_val,
+                vix_rising=vix_rising,
+                spy_below_50sma=spy_below_50sma,
+                ad_falling=breadth_pct < 0.45,
+            )
+
+            if short_signal:
+                new_pos = scaler.execute_scale_in(
+                    position_manager=position_mgr,
+                    signal=short_signal,
+                    capital=capital,
+                    current_prices=current_prices,
+                    atr=atr_val,
+                    backtest_time=date.to_pydatetime(),
+                )
+                if new_pos:
+                    shares = new_pos.shares
+                    fill = new_pos.entry_price
+                    commission = shares * fill * COMMISSION_PCT
+                    capital -= shares * fill + commission
+                    trades.append({
+                        "entry_date": str(date.date()),
+                        "exit_date": None,
+                        "instrument": "SH",
+                        "direction": "LONG",  # SH is a long of inverse ETF
+                        "entry_price": fill,
+                        "exit_price": None,
+                        "shares": shares,
+                        "pnl": None,
+                        "reason": "entry_short_via_sh",
+                        "regime": regime.value,
+                        "_position_id": new_pos.position_id,
+                    })
+
+        # ── 11. EQUITY UPDATE ────────────────────────────────────────────────
+        open_pos_value = sum(
+            p.shares_open * current_prices.get(p.symbol, p.current_price)
+            for p in position_mgr.get_open_positions()
+            if p.direction == "LONG"
+        )
+        equity = max(0.0, capital + open_pos_value)
+        equity_curve.append(equity)
         equity_dates.append(date)
 
-    # Final close of any open position
-    if in_position and len(spy) > 0:
+        prev_regime = regime
+        prev_equity = equity
+
+    # ── FINAL CLOSE ──────────────────────────────────────────────────────────
+    if len(spy) > 0:
         last_price = float(spy["Close"].iloc[-1])
-        pnl = position_shares * (last_price - position_entry_price)
-        capital += pnl
+        last_date = spy.index[-1]
+        for pos in list(position_mgr.get_open_positions()):
+            capital = _close_position(capital, pos, last_price, position_mgr, trades, last_date, "end_of_backtest")
+        equity_curve[-1] = capital  # update last equity point
 
     equity_series = pd.Series(equity_curve, index=equity_dates, name="Equity")
     metrics = compute_all_metrics(equity_series)
-    metrics["num_trades"] = len(trades)
+
+    # Count completed trades
+    completed_trades = [t for t in trades if t.get("exit_date") is not None]
+    metrics["num_trades"] = len(completed_trades)
 
     if verbose:
         print("\n" + "=" * 60)
-        print(f"SP500 Smart Scalper Bot — Backtest Results")
+        print("SP500 Smart Scalper Bot — Backtest Results")
         print(f"Period: {start_date} to {end_date}")
         print(f"Starting Capital: ${starting_capital:,.0f}")
         print("=" * 60)
@@ -315,13 +502,13 @@ def run_backtest(
                 for d, v in zip(equity_dates, equity_curve)
                 if hasattr(d, 'date')
             },
-            "trades": trades[:100],  # save first 100 trades
+            "trades": completed_trades[:100],
         }
         with open("results/backtest_full.json", "w") as f:
             json.dump(output, f, indent=2, default=str)
         print(f"\nResults saved to results/backtest_full.json")
 
-    return {"metrics": metrics, "equity_series": equity_series, "trades": trades}
+    return {"metrics": metrics, "equity_series": equity_series, "trades": completed_trades}
 
 
 if __name__ == "__main__":

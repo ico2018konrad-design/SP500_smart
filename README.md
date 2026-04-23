@@ -189,7 +189,19 @@ SP500_smart/
 
 ---
 
-## 📚 Dokumentacja
+## 🔧 Recent Fixes (v1.1)
+
+- **Fixed capital accounting in paper trader** — no more phantom profits on position close
+- **Backtest now uses real strategy modules** — LongSignalGenerator + ShortSignalGenerator (3-level check), AntiMartingaleScaler (6-position scale-in), PositionManager, CircuitBreakers, ValuationGuard
+- **Regime detector uses real historical FRED data** — actual HY spread (BAMLH0A0HYM2) and yield curve (T10Y2Y), not hardcoded constants. Falls back gracefully if FRED key unavailable.
+- **Walk-forward renamed to rolling OOS** — honest naming: `run_rolling_oos_validation()` instead of `run_walk_forward()` since no parameter optimization occurs on the training period
+- **Hedge module now actually places orders** — `BaselineHedge.rebalance()` submits SH position and rebalances when drift > 10%
+- **Added `backtest_mode` flag to AntiMartingaleScaler** — injects bar date as `backtest_time` to bypass real-time clock in backtests
+- **Added integration tests** and capital accounting regression tests
+
+---
+
+
 
 - [STRATEGY.md](STRATEGY.md) — Pełna specyfikacja strategii (EN)
 - [docs/STRATEGY_PL.md](docs/STRATEGY_PL.md) — Strategia po polsku

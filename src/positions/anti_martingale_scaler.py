@@ -35,11 +35,13 @@ class AntiMartingaleScaler:
         min_hours_between: float = 2.0,      # min time between entries
         max_positions: int = 6,
         position_size_pct: float = 0.1667,   # 16.67% per position (1/6)
+        backtest_mode: bool = False,         # True: bypass real-time clock checks
     ):
         self.profit_threshold = profit_threshold
         self.min_hours_between = min_hours_between
         self.max_positions = max_positions
         self.position_size_pct = position_size_pct
+        self.backtest_mode = backtest_mode
         self._last_entry_time: Optional[datetime] = None
 
     def can_scale_in(
@@ -47,8 +49,15 @@ class AntiMartingaleScaler:
         position_manager: PositionManager,
         symbol: str,
         direction: str,
+        backtest_time: Optional[datetime] = None,
     ) -> tuple:
         """Check if scaling in is allowed.
+
+        Args:
+            position_manager: Current position manager state
+            symbol: Trading symbol
+            direction: LONG or SHORT
+            backtest_time: Bar datetime for backtest mode (bypasses datetime.now())
 
         Returns (can_scale, reason)
         """
@@ -60,7 +69,8 @@ class AntiMartingaleScaler:
 
         # Check time since last entry
         if self._last_entry_time is not None:
-            elapsed = datetime.now() - self._last_entry_time
+            now = backtest_time if (self.backtest_mode and backtest_time is not None) else datetime.now()
+            elapsed = now - self._last_entry_time
             min_elapsed = timedelta(hours=self.min_hours_between)
             if elapsed < min_elapsed:
                 remaining = (min_elapsed - elapsed).total_seconds() / 3600
@@ -104,6 +114,7 @@ class AntiMartingaleScaler:
         capital: float,
         current_prices: Dict[str, float],
         atr: float = 0.0,
+        backtest_time: Optional[datetime] = None,
     ) -> Optional[Position]:
         """Execute scale-in if conditions are met.
 
@@ -113,6 +124,7 @@ class AntiMartingaleScaler:
             capital: Available allocated capital
             current_prices: Current prices for all symbols
             atr: Current ATR for trailing stop calculation
+            backtest_time: Bar datetime for backtest mode
 
         Returns:
             New Position if opened, None otherwise
@@ -120,7 +132,7 @@ class AntiMartingaleScaler:
         direction = signal.direction.value
         symbol = signal.symbol
 
-        can_scale, reason = self.can_scale_in(position_manager, symbol, direction)
+        can_scale, reason = self.can_scale_in(position_manager, symbol, direction, backtest_time=backtest_time)
 
         if not can_scale:
             logger.debug("Scale-in rejected for %s %s: %s", direction, symbol, reason)
@@ -164,7 +176,7 @@ class AntiMartingaleScaler:
                         prev_pos.position_id, scale_number
                     )
 
-        self._last_entry_time = datetime.now()
+        self._last_entry_time = backtest_time if (self.backtest_mode and backtest_time is not None) else datetime.now()
         logger.info(
             "Scale-in #%d executed: %s %s %d shares @ %.2f (reason: %s)",
             scale_number, direction, symbol, shares, entry_price, reason
