@@ -240,3 +240,160 @@ class TestMacroTimeSeries:
             b_rising = macro.get_breadth_on(dates[-1], df_rising)
 
         assert b_declining < b_rising, "Breadth should be lower in declining market"
+
+
+
+def make_bull_spy(n_days: int = 500, start_price: float = 380.0, seed: int = 7) -> pd.DataFrame:
+    """Generate strong bull market SPY data (steady uptrend, low vola)."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start="2023-01-03", periods=n_days)
+    returns = rng.normal(0.001, 0.008, n_days)
+    close = start_price * np.cumprod(1 + returns)
+    high = close * (1 + rng.uniform(0.001, 0.006, n_days))
+    low = close * (1 - rng.uniform(0.001, 0.006, n_days))
+    open_ = close * (1 + rng.normal(0, 0.003, n_days))
+    volume = rng.integers(60_000_000, 140_000_000, n_days).astype(float)
+    return pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume},
+        index=dates,
+    )
+
+
+def make_bear_spy(n_days: int = 500, start_price: float = 480.0, seed: int = 13) -> pd.DataFrame:
+    """Generate bear market SPY data (steadily declining)."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start="2008-01-02", periods=n_days)
+    returns = rng.normal(-0.002, 0.018, n_days)
+    close = start_price * np.cumprod(1 + returns)
+    close = np.maximum(close, 10.0)
+    high = close * (1 + rng.uniform(0.002, 0.012, n_days))
+    low = close * (1 - rng.uniform(0.002, 0.015, n_days))
+    open_ = close * (1 + rng.normal(0, 0.008, n_days))
+    volume = rng.integers(80_000_000, 200_000_000, n_days).astype(float)
+    return pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume},
+        index=dates,
+    )
+
+
+def make_chop_spy(n_days: int = 500, start_price: float = 420.0, seed: int = 21) -> pd.DataFrame:
+    """Generate choppy/sideways market SPY data."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start="2015-01-02", periods=n_days)
+    returns = rng.normal(0.00005, 0.010, n_days)
+    close = start_price * np.cumprod(1 + returns)
+    high = close * (1 + rng.uniform(0.001, 0.008, n_days))
+    low = close * (1 - rng.uniform(0.001, 0.008, n_days))
+    open_ = close * (1 + rng.normal(0, 0.004, n_days))
+    volume = rng.integers(50_000_000, 120_000_000, n_days).astype(float)
+    return pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume},
+        index=dates,
+    )
+
+
+def make_low_vix(spy_dates: pd.DatetimeIndex, level: float = 14.0, seed: int = 5) -> pd.DataFrame:
+    """Generate low-VIX data (bull market)."""
+    rng = np.random.default_rng(seed)
+    vix_vals = level + rng.normal(0, 1.5, len(spy_dates))
+    vix_vals = np.clip(vix_vals, 10, 25)
+    return pd.DataFrame({"Close": vix_vals}, index=spy_dates)
+
+
+def make_high_vix(spy_dates: pd.DatetimeIndex, level: float = 35.0, seed: int = 9) -> pd.DataFrame:
+    """Generate high-VIX data (bear/panic market)."""
+    rng = np.random.default_rng(seed)
+    vix_vals = level + rng.normal(0, 8, len(spy_dates))
+    vix_vals = np.clip(vix_vals, 20, 80)
+    return pd.DataFrame({"Close": vix_vals}, index=spy_dates)
+
+
+class TestBullBearChopBacktest:
+    """Verify the strategy generates trades in bull markets and limits
+    drawdown in bear markets, using synthetic data with defined characteristics.
+    """
+
+    def _run_with_data(self, spy, vix, start_date, end_date):
+        """Helper: run backtest with patched data loaders."""
+        from src.backtest.honest_backtest import run_backtest
+
+        with patch("src.backtest.honest_backtest.load_spy", return_value=spy), \
+             patch("src.backtest.honest_backtest.load_vix", return_value=vix), \
+             patch("src.data.macro_timeseries.load_fred_series", return_value=pd.Series(dtype=float)), \
+             patch("src.data.macro_timeseries.get_fred_api_key", return_value=None):
+            return run_backtest(
+                start_date=start_date,
+                end_date=end_date,
+                starting_capital=5000.0,
+                verbose=False,
+            )
+
+    def test_bull_market_generates_trades(self):
+        """Strong bull market MUST generate trades (critical regression test).
+
+        The bot had a bug where 0 trades were generated in bull markets because
+        all triggers were oversold/mean-reversion only. The trend-following mode
+        must fire in uptrending conditions.
+        """
+        spy = make_bull_spy(n_days=500)
+        vix = make_low_vix(spy.index)
+
+        result = self._run_with_data(spy, vix, "2023-01-03", "2024-12-31")
+
+        num_trades = result["metrics"].get("num_trades", 0)
+        assert num_trades >= 5, (
+            f"Expected >=5 trades in bull market, got {num_trades}. "
+            f"Trend-following signal generation is broken."
+        )
+
+        total_return = result["metrics"].get("total_return", -99)
+        assert total_return > -0.30, (
+            f"Expected >-30% return in bull market, got {total_return:.1%}."
+        )
+
+    def test_bear_market_limits_drawdown(self):
+        """Bear market — circuit breakers and regime detection should limit drawdown."""
+        spy = make_bear_spy(n_days=500)
+        vix = make_high_vix(spy.index)
+
+        result = self._run_with_data(spy, vix, "2008-01-02", "2009-12-31")
+
+        max_dd = result["metrics"].get("max_drawdown", -99)
+        assert max_dd > -0.70, (
+            f"Drawdown worse than -70% in bear market — circuit breakers not limiting losses. "
+            f"Got {max_dd:.1%}"
+        )
+
+        end_equity = result["metrics"].get("end_equity", 0)
+        assert end_equity > 0, "Portfolio went bankrupt — circuit breakers failed"
+
+    def test_chop_market_realistic_return(self):
+        """Choppy/sideways market — bot should not lose excessively."""
+        spy = make_chop_spy(n_days=500)
+        vix = make_synthetic_vix(spy.index, seed=33)
+
+        result = self._run_with_data(spy, vix, "2015-01-02", "2016-12-31")
+
+        total_return = result["metrics"].get("total_return", -99)
+        assert total_return > -0.50, (
+            f"Lost more than 50% in choppy market — got {total_return:.1%}. "
+            f"Something is wrong with the strategy in CHOP regime."
+        )
+
+    def test_backtest_metrics_no_astronomical_values(self):
+        """All metrics must be reasonable — no div-by-zero artifacts like -5e16."""
+        spy = make_bull_spy(n_days=400)
+        vix = make_low_vix(spy.index)
+
+        result = self._run_with_data(spy, vix, "2023-01-03", "2024-06-30")
+
+        metrics = result["metrics"]
+        for key, val in metrics.items():
+            if isinstance(val, float):
+                if val in (float("inf"), float("-inf")):
+                    continue  # infinite ratios are OK (no downside)
+                assert not (val != val), f"Metric '{key}' is NaN"
+                assert abs(val) < 1e10, (
+                    f"Metric '{key}' is astronomically large: {val} — "
+                    f"likely a divide-by-zero bug"
+                )
