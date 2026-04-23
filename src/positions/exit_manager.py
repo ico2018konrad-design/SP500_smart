@@ -48,6 +48,7 @@ class ExitManager:
         vix: float = 20.0,
         spy_1h_return: float = 0.0,
         current_time: Optional[datetime] = None,
+        consecutive_bear_days: int = 0,
     ) -> List[Tuple[str, str, float]]:
         """Check all exit conditions for open positions.
 
@@ -77,7 +78,9 @@ class ExitManager:
                 continue
 
             # C) Regime forced exit
-            regime_exit = self._check_regime_exit(pos, current_regime, previous_regime)
+            regime_exit = self._check_regime_exit(
+                pos, current_regime, previous_regime, consecutive_bear_days,
+            )
             if regime_exit:
                 exits.append((pos.position_id, f"regime_exit_{regime_exit}", current_price))
                 continue
@@ -181,12 +184,28 @@ class ExitManager:
         pos: Position,
         current_regime: Optional[Regime],
         previous_regime: Optional[Regime],
+        consecutive_bear_days: int = 0,
     ) -> Optional[str]:
-        """Check regime-based forced exits."""
+        """Check regime-based forced exits.
+
+        Core positions (scale_number == 0) are held through minor regime dips:
+          - STRONG_BULL → BULL or BULL → CHOP: no exit (still bullish territory)
+          - Only exit on 2+ consecutive BEAR days or stop loss (handled separately)
+        """
         if current_regime is None or previous_regime is None:
             return None
 
         if pos.direction == "LONG":
+            is_core = pos.scale_number == 0
+
+            # Core positions: only exit on confirmed BEAR (2+ consecutive days)
+            if is_core:
+                if current_regime == Regime.BEAR and consecutive_bear_days >= 2:
+                    return "bear_confirmed_2days"
+                # Do NOT exit core on BULL→CHOP or STRONG_BULL→BULL transitions
+                return None
+
+            # Scaled positions (scale_number >= 1): existing stricter behaviour
             # BULL → CHOP: signal UPRO exit (return 'leveraged' for UPRO symbol)
             if previous_regime == Regime.BULL and current_regime == Regime.CHOP:
                 if pos.symbol == "UPRO":

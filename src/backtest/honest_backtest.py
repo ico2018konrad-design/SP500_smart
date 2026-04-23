@@ -178,8 +178,16 @@ def run_backtest(
     end_date: str = "2025-12-31",
     starting_capital: float = 5000.0,
     verbose: bool = True,
+    mode: str = "normal",
 ) -> dict:
     """Run full honest backtest using real strategy modules.
+
+    Args:
+        start_date: Backtest start date.
+        end_date: Backtest end date.
+        starting_capital: Starting capital in USD.
+        verbose: Whether to print results to stdout.
+        mode: "normal" (full strategy) or "buy_and_hold" (SPY buy-and-hold sanity check).
 
     Returns dict with equity curve and performance metrics.
     """
@@ -199,6 +207,33 @@ def run_backtest(
     vix = vix.loc[common_idx]
 
     logger.info("Data loaded: %d trading days", len(spy))
+
+    # ── BUY-AND-HOLD SANITY MODE ─────────────────────────────────────────────
+    if mode == "buy_and_hold":
+        first_price = float(spy["Close"].iloc[0])
+        last_price = float(spy["Close"].iloc[-1])
+        shares = int(starting_capital * 0.99 / first_price)
+        cost = shares * first_price * (1 + SLIPPAGE_PCT)
+        commission = cost * COMMISSION_PCT
+        capital_bh = starting_capital - cost - commission
+        final_val = capital_bh + shares * last_price * (1 - SLIPPAGE_PCT) - shares * last_price * COMMISSION_PCT
+        equity_bh = pd.Series(
+            [starting_capital, final_val],
+            index=[spy.index[0], spy.index[-1]],
+            name="Equity",
+        )
+        metrics_bh = compute_all_metrics(equity_bh)
+        metrics_bh["num_trades"] = 1
+        if verbose:
+            print("\n" + "=" * 60)
+            print("BUY-AND-HOLD SPY — Sanity Check")
+            print(f"Period: {start_date} to {end_date}")
+            print(f"Starting Capital: ${starting_capital:,.0f}")
+            print("=" * 60)
+            print(f"Final Equity:    ${final_val:,.0f}")
+            print(f"Total Return:    {metrics_bh['total_return']:.1%}")
+            print("=" * 60)
+        return {"metrics": metrics_bh, "equity_series": equity_bh, "trades": []}
 
     # Load macro time series (FRED; falls back gracefully)
     macro = MacroTimeSeries(start=start_date)
@@ -229,9 +264,23 @@ def run_backtest(
 
     # Track regime distribution for logging
     regime_counts: dict = {}
-    signals_generated = 0
-    entries_executed = 0
+
+    # Signal / entry / exit counters (split for debugging clarity)
+    trend_follow_signals = 0
+    mean_revert_signals = 0
     short_signals_generated = 0
+    core_positions_opened = 0
+    scale_in_trades = 0
+    short_entries = 0
+    stop_losses_hit = 0
+    targets_reached = 0
+    regime_exits_count = 0
+    time_stops_count = 0
+
+    # Core position whipsaw guards
+    last_core_exit_date: pd.Timestamp = None  # date of last core stop-out
+    regime_history: list = []                 # rolling regime history for confirmation
+    consecutive_bear_days: int = 0            # track consecutive BEAR days for soft exit
 
     # Track open position costs for equity calculation (cash = capital only after debits)
     prev_regime: Regime = Regime.BULL
@@ -294,6 +343,17 @@ def run_backtest(
         # Track regime distribution
         regime_label = regime.value if hasattr(regime, 'value') else str(regime)
         regime_counts[regime_label] = regime_counts.get(regime_label, 0) + 1
+
+        # Track consecutive BEAR days for softened core exit logic
+        if regime == Regime.BEAR:
+            consecutive_bear_days += 1
+        else:
+            consecutive_bear_days = 0
+
+        # Rolling regime history for 3-day confirmation before opening core
+        regime_history.append(regime)
+        if len(regime_history) > 5:
+            regime_history.pop(0)
 
         # ── 5. VALUATION GUARD ──────────────────────────────────────────────
         try:
@@ -358,10 +418,24 @@ def run_backtest(
             previous_regime=prev_regime,
             vix=vix_val,
             current_time=date.to_pydatetime(),
+            consecutive_bear_days=consecutive_bear_days,
         )
         for pos_id, reason, close_price in full_exits:
             pos = position_mgr.positions.get(pos_id)
             if pos and pos.shares_open > 0:
+                # Track exit types for summary reporting
+                if reason == "stop_loss":
+                    stop_losses_hit += 1
+                    if pos.scale_number == 0:
+                        # Core position stopped out — enforce cooldown
+                        last_core_exit_date = date
+                elif reason.startswith("target"):
+                    targets_reached += 1
+                elif "regime_exit" in reason:
+                    regime_exits_count += 1
+                elif reason == "time_stop":
+                    time_stops_count += 1
+
                 capital = _close_position(capital, pos, close_price, position_mgr, trades, date, reason)
 
         # ── 8. SKIP ENTRIES IF HALTED ────────────────────────────────────────
@@ -373,7 +447,10 @@ def run_backtest(
             continue
 
         # ── 9. CORE POSITION LOGIC (STRONG_BULL / BULL) ──────────────────────
-        # Maintain a base exposure in bullish regimes without waiting for a signal
+        # Maintain a base exposure in bullish regimes without waiting for a signal.
+        # Guards:
+        #   a) Cooldown: 5 trading days (~7 calendar days) after core stop-out
+        #   b) Regime confirmation: 3 consecutive days of same regime before entry
         core_target_pct = {
             Regime.STRONG_BULL: 0.30,
             Regime.BULL: 0.20,
@@ -382,7 +459,19 @@ def run_backtest(
             Regime.BEAR: 0.0,
         }.get(regime, 0.0)
 
-        if core_target_pct > 0 and capital > 100:
+        # Guard a): cooldown after stop-out
+        core_in_cooldown = (
+            last_core_exit_date is not None
+            and (date - last_core_exit_date).days < 7
+        )
+
+        # Guard b): require 3 consecutive days of the same regime
+        regime_stable = (
+            len(regime_history) >= 3
+            and all(r == regime for r in regime_history[-3:])
+        )
+
+        if core_target_pct > 0 and capital > 100 and not core_in_cooldown and regime_stable:
             core_instrument = "UPRO" if (regime == Regime.STRONG_BULL and effective_leverage >= 2.0) else "SPY"
             has_core = any(
                 p.symbol == core_instrument and p.scale_number == 0
@@ -395,7 +484,10 @@ def run_backtest(
                 core_cost = core_shares * core_price * (1 + SLIPPAGE_PCT)
                 core_commission = core_cost * COMMISSION_PCT
                 if core_cost + core_commission <= capital * 0.95:
-                    core_stop = core_price * (1 - 0.03)  # 3×ATR approx wide stop
+                    # Wider stop for core: max(4×ATR, 5%) to survive normal pullbacks
+                    atr_stop_dist = 4.0 * atr_val / core_price  # ATR as fraction of price
+                    core_stop_pct = max(atr_stop_dist, 0.05)
+                    core_stop = core_price * (1 - core_stop_pct)
                     core_pos = position_mgr.add_position(
                         symbol=core_instrument,
                         direction="LONG",
@@ -409,7 +501,7 @@ def run_backtest(
                     )
                     if core_pos:
                         capital -= core_cost + core_commission
-                        entries_executed += 1
+                        core_positions_opened += 1
                         trades.append({
                             "entry_date": str(date.date()),
                             "exit_date": None,
@@ -424,9 +516,9 @@ def run_backtest(
                             "_position_id": core_pos.position_id,
                         })
                         logger.info(
-                            "CORE position opened: %s %d @ %.2f (%s regime, %.0f%% alloc)",
+                            "CORE position opened: %s %d @ %.2f (%s regime, %.0f%% alloc, stop=%.1f%%)",
                             core_instrument, core_shares, core_pos.entry_price,
-                            regime_label, core_target_pct * 100,
+                            regime_label, core_target_pct * 100, core_stop_pct * 100,
                         )
 
         # ── 10. GENERATE LONG SIGNALS ─────────────────────────────────────────
@@ -445,7 +537,12 @@ def run_backtest(
             )
 
             if long_signal:
-                signals_generated += 1
+                # Track signal type
+                if regime in (Regime.STRONG_BULL, Regime.BULL):
+                    trend_follow_signals += 1
+                else:
+                    mean_revert_signals += 1
+
                 new_pos = scaler.execute_scale_in(
                     position_manager=position_mgr,
                     signal=long_signal,
@@ -455,7 +552,7 @@ def run_backtest(
                     backtest_time=date.to_pydatetime(),
                 )
                 if new_pos:
-                    entries_executed += 1
+                    scale_in_trades += 1
                     shares = new_pos.shares
                     fill = new_pos.entry_price
                     commission = shares * fill * COMMISSION_PCT
@@ -505,7 +602,7 @@ def run_backtest(
                     backtest_time=date.to_pydatetime(),
                 )
                 if new_pos:
-                    entries_executed += 1
+                    short_entries += 1
                     shares = new_pos.shares
                     fill = new_pos.entry_price
                     commission = shares * fill * COMMISSION_PCT
@@ -552,6 +649,14 @@ def run_backtest(
     completed_trades = [t for t in trades if t.get("exit_date") is not None]
     metrics["num_trades"] = len(completed_trades)
 
+    # ── BENCHMARK: SPY buy-and-hold for same period ─────────────────────────
+    if len(spy) >= 2:
+        spy_start = float(spy["Close"].iloc[0])
+        spy_end = float(spy["Close"].iloc[-1])
+        spy_return = (spy_end / spy_start) - 1.0
+    else:
+        spy_return = 0.0
+
     if verbose:
         print("\n" + "=" * 60)
         print("SP500 Smart Scalper Bot — Backtest Results")
@@ -574,6 +679,13 @@ def run_backtest(
         print(f"Num Trades:      {metrics['num_trades']}")
         print("=" * 60)
 
+        # Benchmark comparison
+        outperform = metrics['total_return'] - spy_return
+        print(f"\nBenchmark Comparison:")
+        print(f"  Bot return:   {metrics['total_return']:+.1%}")
+        print(f"  SPY return:   {spy_return:+.1%}   (buy-and-hold same period)")
+        print(f"  Outperform:   {outperform:+.1%}")
+
         # Regime distribution summary
         total_bars = sum(regime_counts.values()) or 1
         print("\nRegime Distribution:")
@@ -583,9 +695,18 @@ def run_backtest(
             print(f"  {rname:<12}: {count:5d} days ({pct:5.1f}%)")
 
         print(f"\nSignal generation:")
-        print(f"  Long signals generated:  {signals_generated}")
-        print(f"  Long entries executed:   {entries_executed}")
-        print(f"  Short signals generated: {short_signals_generated}")
+        print(f"  Trend-follow signals:    {trend_follow_signals}")
+        print(f"  Mean-revert signals:     {mean_revert_signals}")
+        print(f"  Short signals:           {short_signals_generated}")
+        print(f"\nTrade entries:")
+        print(f"  Core positions opened:   {core_positions_opened}")
+        print(f"  Scale-in trades:         {scale_in_trades}")
+        print(f"  Short entries:           {short_entries}")
+        print(f"\nTrade exits:")
+        print(f"  Stop-losses hit:         {stop_losses_hit}")
+        print(f"  Targets reached:         {targets_reached}")
+        print(f"  Regime exits:            {regime_exits_count}")
+        print(f"  Time stops:              {time_stops_count}")
         print("=" * 60)
 
         # Save results
@@ -599,11 +720,22 @@ def run_backtest(
                 "slippage_pct": SLIPPAGE_PCT,
             },
             "metrics": metrics,
+            "benchmark": {
+                "spy_return": spy_return,
+                "outperformance": outperform,
+            },
             "regime_distribution": regime_counts,
             "signal_stats": {
-                "long_signals_generated": signals_generated,
-                "long_entries_executed": entries_executed,
+                "trend_follow_signals": trend_follow_signals,
+                "mean_revert_signals": mean_revert_signals,
                 "short_signals_generated": short_signals_generated,
+                "core_positions_opened": core_positions_opened,
+                "scale_in_trades": scale_in_trades,
+                "short_entries": short_entries,
+                "stop_losses_hit": stop_losses_hit,
+                "targets_reached": targets_reached,
+                "regime_exits": regime_exits_count,
+                "time_stops": time_stops_count,
             },
             "equity_curve": {
                 str(d.date()): float(v)
