@@ -149,7 +149,11 @@ def _close_position(
     shares_open = pos.shares_open
     commission = shares_open * fill * COMMISSION_PCT
 
-    # Credit: sale proceeds - commission (cost was already debited on open)
+    # Credit: sale proceeds minus commission.
+    # Note: In this backtest, short exposure is modeled via long positions in
+    # inverse ETFs (SH, SPXS). True naked SHORTs would require a different
+    # accounting model (proceeds received at entry, cost paid at close).
+    # The code below handles LONG positions (including inverse ETF longs).
     capital += shares_open * fill - commission
 
     pnl = shares_open * (fill - pos.entry_price) if pos.direction == "LONG" \
@@ -236,7 +240,16 @@ def run_backtest(
         vix_val = float(vix_row["Close"]) if "Close" in vix_row else 20.0
 
         # ── 1. UPDATE PRICES ON OPEN POSITIONS ──────────────────────────────
-        current_prices = {"SPY": close_spy, "UPRO": close_spy * 3.0, "SH": 100.0 / close_spy * 45.0, "SPXS": close_spy}
+        # Approximate SH price: SH is a -1x daily inverse of SPY.
+        # When SPY is ~400, SH ~36; rough approximation: SH_price ≈ 14400 / close_spy
+        # (calibrated so SH ≈ 36 when SPY ≈ 400).
+        sh_approx = 14400.0 / close_spy if close_spy > 0 else 36.0
+        current_prices = {
+            "SPY": close_spy,
+            "UPRO": close_spy * 3.0,
+            "SH": sh_approx,
+            "SPXS": close_spy,
+        }
         position_mgr.update_prices(current_prices)
 
         # ── 2. DAILY BORROW / EXPENSE RATIO DEDUCTIONS ──────────────────────
@@ -350,7 +363,8 @@ def run_backtest(
         if regime in (Regime.STRONG_BULL, Regime.BULL) and not cb_status.is_halted():
             # Determine instrument: UPRO in strong bull w/ leverage >= 2, else SPY
             instrument = "UPRO" if (regime == Regime.STRONG_BULL and effective_leverage >= 2.0) else "SPY"
-            spy_below_50sma = not spy_above_200sma  # simplification
+            ema50_long = calc_ema(spy_slice["Close"], 50).iloc[-1]
+            spy_below_50sma = (not pd.isna(ema50_long)) and (close_spy < float(ema50_long))
 
             long_signal = long_sig_gen.generate(
                 symbol=instrument,

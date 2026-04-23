@@ -218,13 +218,23 @@ class TestMacroTimeSeries:
             prices_declining = pd.Series(
                 [400.0 - i * 1.5 for i in range(100)], index=dates
             )
-            df_declining = pd.DataFrame({"Close": prices_declining, "High": prices_declining * 1.005, "Low": prices_declining * 0.995, "Volume": 1e8})
+            df_declining = pd.DataFrame({
+                "Close": prices_declining,
+                "High": prices_declining * 1.005,
+                "Low": prices_declining * 0.995,
+                "Volume": 1e8,
+            })
 
             # Rising market: price well above SMA
             prices_rising = pd.Series(
                 [300.0 + i * 1.5 for i in range(100)], index=dates
             )
-            df_rising = pd.DataFrame({"Close": prices_rising, "High": prices_rising * 1.005, "Low": prices_rising * 0.995, "Volume": 1e8})
+            df_rising = pd.DataFrame({
+                "Close": prices_rising,
+                "High": prices_rising * 1.005,
+                "Low": prices_rising * 0.995,
+                "Volume": 1e8,
+            })
 
             b_declining = macro.get_breadth_on(dates[-1], df_declining)
             b_rising = macro.get_breadth_on(dates[-1], df_rising)
