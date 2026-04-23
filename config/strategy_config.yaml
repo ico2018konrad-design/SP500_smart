@@ -1,0 +1,183 @@
+# SP500 Smart Scalper Bot — Strategy Configuration
+# DEFAULT: paper trading, mini mode, LLM disabled
+
+mode: "mini"  # "mini" or "full"
+trading_mode: "paper"  # "paper" or "live"
+llm_enabled: false
+starting_capital: 5000  # CHF
+
+# ─── INSTRUMENTS ───────────────────────────────────────────────
+instruments:
+  mini: ["SPY", "UPRO", "SH", "SPXS"]
+  full: ["SPY", "UPRO", "SH", "SPXS", "VXX"]
+
+# ─── REGIME THRESHOLDS ─────────────────────────────────────────
+regime:
+  strong_bull_min: 10
+  bull_min: 8
+  chop_min: 6
+  caution_min: 4
+  # 0-3 = BEAR
+
+  # Max leverage per regime
+  leverage_table:
+    STRONG_BULL: 2.5
+    BULL: 2.0
+    CHOP: 1.0
+    CAUTION: 0.5
+    BEAR: 0.0
+
+  # Allocation % per instrument per regime
+  allocation:
+    STRONG_BULL:
+      SPY: 0.40
+      UPRO: 0.50
+      SH: 0.05
+      SPXS: 0.00
+      cash: 0.05
+    BULL:
+      SPY: 0.60
+      UPRO: 0.25
+      SH: 0.10
+      SPXS: 0.00
+      cash: 0.05
+    CHOP:
+      SPY: 0.50
+      UPRO: 0.00
+      SH: 0.15
+      SPXS: 0.00
+      cash: 0.35
+    CAUTION:
+      SPY: 0.30
+      UPRO: 0.00
+      SH: 0.20
+      SPXS: 0.00
+      cash: 0.50
+    BEAR:
+      SPY: 0.00
+      UPRO: 0.00
+      SH: 0.30
+      SPXS: 0.10
+      cash: 0.60
+
+# ─── VALUATION GUARD ────────────────────────────────────────────
+valuation_guard:
+  overextension_threshold: 1.15   # SPY > 200SMA * 1.15 → penalty
+  overextension_penalty: 0.75
+  cape_high: 35
+  cape_penalty: 0.75
+  vix_complacency: 13
+  vix_complacency_penalty: 0.80
+  correction_drought_months: 18   # months since last 10% correction
+  correction_drought_penalty: 0.70
+
+# ─── SIGNAL PARAMETERS ──────────────────────────────────────────
+signals:
+  # Entry requirements
+  min_regime_score_long: 8
+  max_atr_pct_long: 0.03   # ATR < 3%
+  min_regime_score_short_max: 5
+  vix_threshold_short: 20
+
+  # Long trigger (min 3 of 5)
+  long_trigger_min: 3
+  rsi_oversold: 40
+  stoch_oversold: 30
+  bb_lower_required: true
+
+  # Short trigger (min 3 of 5)
+  short_trigger_min: 3
+  rsi_overbought: 68
+  stoch_overbought: 75
+
+  # Confirmation (min 2 of 4)
+  long_confirm_min: 2
+  short_confirm_min: 2
+  volume_multiplier: 1.3
+  tick_threshold: 500
+
+  # R:R and stops
+  long_stop_pct: 0.015      # -1.5%
+  long_target1_pct: 0.020   # +2%
+  long_target2_pct: 0.045   # +4.5%
+  long_target3_pct: 0.080   # +8%
+  short_stop_pct: 0.015
+  short_target1_pct: 0.020
+  short_target2_pct: 0.040
+  min_rr_long: 2.0
+  min_rr_short: 1.5
+
+# ─── POSITION MANAGEMENT ────────────────────────────────────────
+positions:
+  max_positions: 6
+  position_size_pct: 0.1667    # 1/6 = 16.67% of allocated capital
+  scale_in_profit_threshold: 0.01   # +1% before adding next
+  min_hours_between_entries: 2
+
+  # Trailing stop
+  trailing_activate_pct: 0.03   # activate after +3%
+  trailing_atr_multiplier: 1.5
+
+  # Time stop
+  time_stop_days: 10
+  time_stop_movement_threshold: 0.01
+
+# ─── HEDGE ──────────────────────────────────────────────────────
+hedge:
+  mini_hedge_instrument: "SH"
+  mini_hedge_pct: 0.10        # 10% in SH always
+
+  full_mode_capital_threshold: 15000
+  full_put_spread_pct: 0.06   # 6% capital/month
+  put_spread_dte: 90
+  put_spread_roll_days: 60
+  put_long_moneyness: 0.93    # long put @ 93% of SPY
+  put_short_moneyness: 0.82   # short put @ 82% of SPY
+
+  # Reactive hedge
+  reactive_spy_drop: -0.01    # SPY -1% intraday
+  reactive_vix_spike: 0.10    # VIX +10% simultaneously
+  reactive_hedge_pct: 0.10    # buy SPXS 10% capital
+  reactive_sh_increase: 0.20  # increase SH to 20% if downgrade
+
+  # Panic triggers
+  panic_vix_threshold: 35
+  panic_spy_drop_2session: -0.05   # SPY -5% in 2 sessions
+  panic_hy_bps_weekly: 100         # HY +100bps in week
+  panic_llm_confidence: 0.70
+  panic_vxx_pct: 0.03
+  panic_spxs_pct: 0.25
+  panic_min_days: 5               # minimum 5 trading days in panic mode
+
+# ─── SCHEDULE (CET) ─────────────────────────────────────────────
+schedule:
+  morning_briefing: "07:00"
+  open_blackout_start: "15:30"
+  open_blackout_end: "16:00"
+  trading_start: "16:00"
+  trading_end: "21:30"
+  close_blackout_start: "21:30"
+  close_blackout_end: "22:00"
+  daily_reconciliation: "22:00"
+  scan_interval_minutes: 5
+  indicator_interval_minutes: 15
+  regime_recalc_hours: 1
+
+# ─── REGIME INDICATOR PERIODS ────────────────────────────────────
+indicators:
+  sma_200: 200
+  sma_50: 50
+  ema_50: 50
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  stoch_k: 14
+  stoch_d: 3
+  stoch_smooth: 3
+  bb_period: 20
+  bb_std: 2.0
+  atr_period: 14
+  adx_period: 14
+  vwap_period: 5  # minutes
+  volume_lookback: 20

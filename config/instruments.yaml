@@ -1,0 +1,87 @@
+# SP500 Smart Scalper Bot — Instrument Definitions
+
+instruments:
+  SPY:
+    name: "SPDR S&P 500 ETF Trust"
+    type: "ETF"
+    role: "core_long"
+    leverage: 1.0
+    direction: 1
+    exchange: "NYSE"
+    currency: "USD"
+    min_shares: 1
+    ibkr_symbol: "SPY"
+    ibkr_sec_type: "STK"
+    ibkr_exchange: "SMART"
+
+  UPRO:
+    name: "ProShares UltraPro S&P 500"
+    type: "ETF"
+    role: "leveraged_long"
+    leverage: 3.0
+    direction: 1
+    exchange: "NYSE"
+    currency: "USD"
+    min_shares: 1
+    ibkr_symbol: "UPRO"
+    ibkr_sec_type: "STK"
+    ibkr_exchange: "SMART"
+    only_in_regime: ["STRONG_BULL", "BULL"]
+
+  SH:
+    name: "ProShares Short S&P 500"
+    type: "ETF"
+    role: "short_exposure"
+    leverage: -1.0
+    direction: -1
+    exchange: "NYSE"
+    currency: "USD"
+    min_shares: 1
+    ibkr_symbol: "SH"
+    ibkr_sec_type: "STK"
+    ibkr_exchange: "SMART"
+    use_for_hedge: true
+
+  SPXS:
+    name: "Direxion Daily S&P 500 Bear 3X Shares"
+    type: "ETF"
+    role: "leveraged_short"
+    leverage: -3.0
+    direction: -1
+    exchange: "NYSE"
+    currency: "USD"
+    min_shares: 1
+    ibkr_symbol: "SPXS"
+    ibkr_sec_type: "STK"
+    ibkr_exchange: "SMART"
+    only_in_regime: ["BEAR", "CAUTION"]
+
+  VXX:
+    name: "iPath Series B S&P 500 VIX Short-Term Futures ETN"
+    type: "ETN"
+    role: "panic_hedge"
+    leverage: 1.0
+    direction: 1
+    exchange: "CBOE"
+    currency: "USD"
+    min_shares: 1
+    ibkr_symbol: "VXX"
+    ibkr_sec_type: "STK"
+    ibkr_exchange: "SMART"
+    full_mode_only: true
+    use_for: "panic_hedge"
+
+# Macro / Volatility tickers (data only, not traded)
+data_tickers:
+  VIX: "^VIX"
+  VIX9D: "^VIX9D"
+  VX1: "^VXN"   # Approx — use CBOE futures if available
+  SP500: "^GSPC"
+
+# FRED series
+fred_series:
+  hy_spread: "BAMLH0A0HYM2"      # BofA HY spread (bps)
+  yield_curve: "T10Y2Y"           # 10Y-2Y spread
+  cape: "CAPE"                    # Shiller CAPE (use multpl.com if FRED unavailable)
+  t10y: "DGS10"
+  t2y: "DGS2"
