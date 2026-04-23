@@ -212,7 +212,7 @@ def run_backtest(
     if mode == "buy_and_hold":
         first_price = float(spy["Close"].iloc[0])
         last_price = float(spy["Close"].iloc[-1])
-        shares = int(starting_capital * 0.99 / first_price)
+        shares = int(starting_capital * 0.99 / first_price)  # 99% allocated; 1% reserve for commissions/slippage
         cost = shares * first_price * (1 + SLIPPAGE_PCT)
         commission = cost * COMMISSION_PCT
         capital_bh = starting_capital - cost - commission
@@ -459,7 +459,7 @@ def run_backtest(
             Regime.BEAR: 0.0,
         }.get(regime, 0.0)
 
-        # Guard a): cooldown after stop-out
+        # Guard a): cooldown after stop-out — 7 calendar days ≈ 5 trading days
         core_in_cooldown = (
             last_core_exit_date is not None
             and (date - last_core_exit_date).days < 7

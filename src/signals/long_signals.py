@@ -218,7 +218,7 @@ class LongSignalGenerator:
 
         Daily bars need wider stops to survive normal daily noise.
         """
-        if timeframe == "daily":
+        if timeframe.lower() == "daily":
             return 0.025, 0.050, 0.090, 0.150
         return self.stop_pct, self.target1_pct, self.target2_pct, self.target3_pct
 
@@ -505,7 +505,10 @@ class LongSignalGenerator:
             return None
 
         total_quality = trigger_count + confirm_count
-        # Threshold adapted: trend-follow min is 1 trigger + 1 confirm = 2 (WEAK), 4+ is MODERATE.
+        # Signal strength based on total_quality (triggers + confirmations):
+        #   2-3 → WEAK (minimum: 1 trigger + 1 confirm in trend-follow)
+        #   4-6 → MODERATE
+        #   7+  → STRONG (multiple strong triggers and confirmations)
         if total_quality >= 7:
             strength = SignalStrength.STRONG
         elif total_quality >= 4:
