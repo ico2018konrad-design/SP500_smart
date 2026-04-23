@@ -476,6 +476,8 @@ class LongSignalGenerator:
             return None
 
         total_quality = trigger_count + confirm_count
+        # Threshold 4: trend-follow mode minimum is 2+1=3 (WEAK), so 4+ is MODERATE.
+        # Previous threshold was 5, but lowered to 4 to match trend-follow min (2 triggers + 1 confirm = 3).
         if total_quality >= 7:
             strength = SignalStrength.STRONG
         elif total_quality >= 4:
