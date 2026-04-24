@@ -213,6 +213,15 @@ class LongSignalGenerator:
 
         return len(triggers_hit), triggers_hit
 
+    def _stop_pct_for_timeframe(self, timeframe: str) -> tuple:
+        """Return (stop_pct, t1_pct, t2_pct, t3_pct) adapted to timeframe.
+
+        Daily bars need wider stops to survive normal daily noise.
+        """
+        if timeframe.lower() == "daily":
+            return 0.025, 0.050, 0.090, 0.150
+        return self.stop_pct, self.target1_pct, self.target2_pct, self.target3_pct
+
     def _trend_follow_triggers(
         self,
         close: pd.Series,
@@ -292,6 +301,15 @@ class LongSignalGenerator:
             if golden_cross and above_both:
                 triggers_hit.append("golden_cross_above_both_emas")
 
+        # Trigger 6: Pure uptrend — EMA50 above EMA200 (definition of bull market).
+        # Added as a standalone signal so that STRONG_BULL/BULL regime days with a
+        # healthy EMA structure always produce at least 1 trigger.
+        if len(ema50_clean) > 1 and len(ema200_clean) > 1:
+            curr_ema50 = float(ema50_clean.iloc[-1])
+            curr_ema200 = float(ema200_clean.iloc[-1])
+            if curr_ema50 > curr_ema200:
+                triggers_hit.append("ema50_above_ema200_uptrend")
+
         return len(triggers_hit), triggers_hit
 
     def _trend_follow_confirmations(
@@ -369,30 +387,35 @@ class LongSignalGenerator:
         timeframe: str,
     ) -> Optional[Signal]:
         """Generate signal using trend-following triggers for BULL/STRONG_BULL regimes."""
-        min_triggers = 2  # more lenient than mean-revert
+        min_triggers = 1  # relaxed: 1 clear signal is enough in a bull regime
         min_confirms = 1  # only 1 of 3 confirmations needed
 
         trigger_count, triggers_hit = self._trend_follow_triggers(close, high, low, volume, open_)
 
         if trigger_count < min_triggers:
-            logger.debug(
-                "TREND-FOLLOW triggers: %d/%d (%s) — insufficient",
-                trigger_count, min_triggers, triggers_hit,
+            logger.info(
+                "[SIGNAL_REJECT] %s %s triggers %d/%d: %s",
+                symbol, regime, trigger_count, min_triggers, triggers_hit,
             )
             return None
 
         confirm_count, confirms_hit = self._trend_follow_confirmations(close, volume, breadth_rising)
 
         if confirm_count < min_confirms:
-            logger.debug(
-                "TREND-FOLLOW confirmations: %d/%d (%s) — insufficient",
-                confirm_count, min_confirms, confirms_hit,
+            logger.info(
+                "[SIGNAL_REJECT] %s %s confirms %d/%d: %s",
+                symbol, regime, confirm_count, min_confirms, confirms_hit,
             )
             return None
 
+        logger.info(
+            "[SIGNAL_ACCEPT] %s %s triggers=%s confirms=%s",
+            symbol, regime, triggers_hit, confirms_hit,
+        )
         return self._build_signal(
             symbol, close, regime_score, regime,
             trigger_count, triggers_hit, confirm_count, confirms_hit,
+            timeframe=timeframe,
         )
 
     def _generate_mean_reversion_signal(
@@ -427,9 +450,9 @@ class LongSignalGenerator:
         )
 
         if trigger_count < min_triggers:
-            logger.debug(
-                "MEAN-REVERT triggers: %d/%d (%s) — insufficient",
-                trigger_count, min_triggers, triggers_hit,
+            logger.info(
+                "[SIGNAL_REJECT] %s %s triggers %d/%d: %s",
+                symbol, regime, trigger_count, min_triggers, triggers_hit,
             )
             return None
 
@@ -440,15 +463,16 @@ class LongSignalGenerator:
         )
 
         if confirm_count < min_confirms:
-            logger.debug(
-                "MEAN-REVERT confirmations: %d/%d (%s) — insufficient",
-                confirm_count, min_confirms, confirms_hit,
+            logger.info(
+                "[SIGNAL_REJECT] %s %s confirms %d/%d: %s",
+                symbol, regime, confirm_count, min_confirms, confirms_hit,
             )
             return None
 
         return self._build_signal(
             symbol, close, regime_score, regime,
             trigger_count, triggers_hit, confirm_count, confirms_hit,
+            timeframe=timeframe,
         )
 
     def _build_signal(
@@ -461,23 +485,30 @@ class LongSignalGenerator:
         triggers_hit: list,
         confirm_count: int,
         confirms_hit: list,
+        timeframe: str = "intraday",
     ) -> Optional[Signal]:
         """Construct Signal object from validated triggers and confirmations."""
         entry_price = float(close.dropna().iloc[-1])
-        stop_price = entry_price * (1 - self.stop_pct)
-        target1 = entry_price * (1 + self.target1_pct)
-        target2 = entry_price * (1 + self.target2_pct)
-        target3 = entry_price * (1 + self.target3_pct)
 
-        rr_ratio = self.target1_pct / self.stop_pct
+        # Adaptive stop and targets: daily bars need wider stops to survive noise
+        stop_pct, target1_pct, target2_pct, target3_pct = self._stop_pct_for_timeframe(timeframe)
+
+        stop_price = entry_price * (1 - stop_pct)
+        target1 = entry_price * (1 + target1_pct)
+        target2 = entry_price * (1 + target2_pct)
+        target3 = entry_price * (1 + target3_pct)
+
+        rr_ratio = target1_pct / stop_pct
 
         if rr_ratio < self.min_rr:
             logger.debug("LONG R:R %.2f below minimum %.2f", rr_ratio, self.min_rr)
             return None
 
         total_quality = trigger_count + confirm_count
-        # Threshold 4: trend-follow mode minimum is 2+1=3 (WEAK), so 4+ is MODERATE.
-        # Previous threshold was 5, but lowered to 4 to match trend-follow min (2 triggers + 1 confirm = 3).
+        # Signal strength based on total_quality (triggers + confirmations):
+        #   2-3 → WEAK (minimum: 1 trigger + 1 confirm in trend-follow)
+        #   4-6 → MODERATE
+        #   7+  → STRONG (multiple strong triggers and confirmations)
         if total_quality >= 7:
             strength = SignalStrength.STRONG
         elif total_quality >= 4:
@@ -549,7 +580,9 @@ class LongSignalGenerator:
             Signal if all levels pass, None otherwise
         """
         # No longs in BEAR
-        if regime in ("BEAR", Regime.BEAR.value if hasattr(Regime, 'BEAR') else "BEAR"):
+        regime_str = regime.value if hasattr(regime, 'value') else str(regime)
+        regime_str = regime_str.upper().replace(" ", "_")  # normalize enum/string variants
+        if regime_str == "BEAR":
             logger.debug("LONG skipped — BEAR regime, no longs")
             return None
 
@@ -570,7 +603,7 @@ class LongSignalGenerator:
         # Level 1: Setup (regime-aware threshold)
         # In CHOP/CAUTION allow slightly lower regime score
         effective_min_score = self.min_regime_score
-        if regime in ("CHOP", "CAUTION"):
+        if regime_str in ("CHOP", "CAUTION"):
             effective_min_score = max(4, self.min_regime_score - 2)
 
         setup_valid, setup_reasons = self.check_setup(
@@ -582,18 +615,17 @@ class LongSignalGenerator:
         )
 
         # Override min regime score check for CHOP/CAUTION
-        if not setup_valid and regime in ("CHOP", "CAUTION"):
+        if not setup_valid and regime_str in ("CHOP", "CAUTION"):
             filtered_reasons = [r for r in setup_reasons if "regime_score" not in r or regime_score >= effective_min_score]
             setup_valid = len(filtered_reasons) == 0
             if not setup_valid:
                 setup_reasons = filtered_reasons
 
         if not setup_valid:
-            logger.debug("LONG setup failed: %s", "; ".join(setup_reasons))
+            logger.info("[SIGNAL_REJECT] %s %s setup_failed: %s", symbol, regime_str, "; ".join(setup_reasons))
             return None
 
         # Branch on regime: trend-follow vs mean-revert
-        regime_str = regime.value if hasattr(regime, 'value') else str(regime)
         if regime_str in ("STRONG_BULL", "BULL"):
             logger.debug("Using TREND-FOLLOW mode for regime=%s, timeframe=%s", regime_str, timeframe)
             return self._generate_trend_follow_signal(
